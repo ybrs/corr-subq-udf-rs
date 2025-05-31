@@ -203,3 +203,22 @@ async fn register_udf(
     ctx.register_udf(udf);
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlparser::dialect::GenericDialect;
+    use sqlparser::parser::Parser;
+    use datafusion::prelude::*;
+
+    #[tokio::test]
+    async fn transform_exists_subquery() -> datafusion::error::Result<()> {
+        let sql = "select 1 where exists(select 1)";
+        let dialect = GenericDialect {};
+        let mut stmt = Parser::parse_sql(&dialect, sql)?.remove(0);
+        let mut ctx = SessionContext::new();
+        let mut counter = 0;
+        transform_statement(&mut stmt, &mut ctx, &mut counter).await?;
+        Ok(())
+    }
+}
