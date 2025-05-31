@@ -1,7 +1,10 @@
 use std::sync::Arc;
 use futures::future::BoxFuture;
 use arrow::datatypes::DataType;
-use datafusion::logical_expr::{create_udf, ColumnarValue, Volatility};
+use datafusion::logical_expr::{
+    ColumnarValue, Volatility, Signature, ScalarUDF,
+    expr_fn::SimpleScalarUDF,
+};
 use datafusion::prelude::SessionContext;
 use sqlparser::ast::*;
 use sqlparser::dialect::GenericDialect;
@@ -156,11 +159,11 @@ fn transform_expr<'a>(
     })
 }
 
-fn replace_with_fn_call(expr: &mut Expr, fn_name: String, cols: &[(Ident, DataType)]) {
+fn replace_with_fn_call(expr: &mut Expr, fn_name: String, cols: &[(Expr, DataType)]) {
     let args: Vec<FunctionArg> = cols
         .iter()
-        .map(|(id, _)| {
-            FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Identifier(id.clone())))
+        .map(|(e, _)| {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(e.clone()))
         })
         .collect();
     *expr = Expr::Function(Function {
@@ -179,19 +182,161 @@ fn replace_with_fn_call(expr: &mut Expr, fn_name: String, cols: &[(Ident, DataTy
     });
 }
 
-// For now no correlated columns are detected.
-// This keeps the example simple and functional.
-fn find_correlated_columns(_q: &Query) -> Vec<(Ident, DataType)> {
-    Vec::new()
+fn find_correlated_columns(q: &Query) -> Vec<(Expr, DataType)> {
+    use std::collections::{HashMap, HashSet};
+
+    fn collect_table_factor(f: &TableFactor, out: &mut HashSet<String>) {
+        match f {
+            TableFactor::Table { name, alias, .. } => {
+                if let Some(a) = alias {
+                    out.insert(a.name.value.clone());
+                } else {
+                    out.insert(name.to_string());
+                }
+            }
+            TableFactor::Derived { alias, .. } => {
+                if let Some(a) = alias {
+                    out.insert(a.name.value.clone());
+                } else {
+                    // Derived table without alias - ignore
+                }
+                // do not recurse into subquery
+            }
+            TableFactor::NestedJoin { table_with_joins, .. } => {
+                collect_table_with_joins(table_with_joins, out);
+            }
+            TableFactor::TableFunction { alias, .. } => {
+                if let Some(a) = alias {
+                    out.insert(a.name.value.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn collect_table_with_joins(twj: &TableWithJoins, out: &mut HashSet<String>) {
+        collect_table_factor(&twj.relation, out);
+        for j in &twj.joins {
+            collect_table_factor(&j.relation, out);
+        }
+    }
+
+    fn collect_expr(expr: &Expr, aliases: &HashSet<String>, cols: &mut HashMap<String, Expr>) {
+        match expr {
+            Expr::Identifier(_) => {
+                // Unqualified identifiers may refer to local columns;
+                // without schema information we ignore them.
+            }
+            Expr::CompoundIdentifier(idents) => {
+                if let Some(first) = idents.first() {
+                    if !aliases.contains(&first.value) {
+                        cols.entry(expr.to_string())
+                            .or_insert_with(|| Expr::CompoundIdentifier(idents.clone()));
+                    }
+                }
+            }
+            Expr::BinaryOp { left, right, .. } => {
+                collect_expr(left, aliases, cols);
+                collect_expr(right, aliases, cols);
+            }
+            Expr::UnaryOp { expr: inner, .. } => collect_expr(inner, aliases, cols),
+            Expr::Nested(inner) => collect_expr(inner, aliases, cols),
+            Expr::Function(f) => match &f.args {
+                FunctionArguments::List(list) => {
+                    for arg in &list.args {
+                        if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) = arg {
+                            collect_expr(e, aliases, cols);
+                        }
+                    }
+                }
+                FunctionArguments::Subquery(_) | FunctionArguments::None => {}
+            },
+            Expr::InList { expr: inner, list, .. } => {
+                collect_expr(inner, aliases, cols);
+                for e in list {
+                    collect_expr(e, aliases, cols);
+                }
+            }
+            Expr::Between { expr: inner, low, high, .. } => {
+                collect_expr(inner, aliases, cols);
+                collect_expr(low, aliases, cols);
+                collect_expr(high, aliases, cols);
+            }
+            Expr::Case { operand, conditions, else_result, .. } => {
+                if let Some(op) = operand {
+                    collect_expr(op, aliases, cols);
+                }
+                for when in conditions {
+                    collect_expr(&when.condition, aliases, cols);
+                    collect_expr(&when.result, aliases, cols);
+                }
+                if let Some(er) = else_result {
+                    collect_expr(er, aliases, cols);
+                }
+            }
+            Expr::Cast { expr: inner, .. } => collect_expr(inner, aliases, cols),
+            Expr::Collate { expr: inner, .. } => collect_expr(inner, aliases, cols),
+            Expr::Substring { expr: inner, substring_from, substring_for, .. } => {
+                collect_expr(inner, aliases, cols);
+                if let Some(e) = substring_from {
+                    collect_expr(e, aliases, cols);
+                }
+                if let Some(e) = substring_for {
+                    collect_expr(e, aliases, cols);
+                }
+            }
+            Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } => {
+                // Do not recurse into nested subqueries
+            }
+            _ => {}
+        }
+    }
+
+    fn collect_from_select(sel: &Select, aliases: &HashSet<String>, cols: &mut HashMap<String, Expr>) {
+        if let Some(selection) = &sel.selection {
+            collect_expr(selection, aliases, cols);
+        }
+        for item in &sel.projection {
+            match item {
+                SelectItem::UnnamedExpr(e) => collect_expr(e, aliases, cols),
+                SelectItem::ExprWithAlias { expr, .. } => collect_expr(expr, aliases, cols),
+                _ => {}
+            }
+        }
+        if let GroupByExpr::Expressions(exprs, _) = &sel.group_by {
+            for g in exprs {
+                collect_expr(g, aliases, cols);
+            }
+        }
+        if let Some(h) = &sel.having {
+            collect_expr(h, aliases, cols);
+        }
+    }
+
+    fn collect_query(q: &Query, aliases: &mut HashSet<String>, cols: &mut HashMap<String, Expr>) {
+        if let SetExpr::Select(sel) = q.body.as_ref() {
+            for twj in &sel.from {
+                collect_table_with_joins(twj, aliases);
+            }
+            let local_aliases = aliases.clone();
+            collect_from_select(sel, &local_aliases, cols);
+        }
+    }
+
+    let mut aliases = HashSet::new();
+    let mut cols_map: HashMap<String, Expr> = HashMap::new();
+    collect_query(q, &mut aliases, &mut cols_map);
+
+    cols_map.into_iter().map(|(_, e)| (e, DataType::Null)).collect()
 }
 
 async fn register_udf(
     ctx: &mut SessionContext,
     name: &str,
     sub_sql: String,
-    cols: &[(Ident, DataType)],
+    cols: &[(Expr, DataType)],
 ) -> datafusion::error::Result<()> {
-    let arg_types: Vec<DataType> = cols.iter().map(|(_, t)| t.clone()).collect();
+    let arg_count = cols.len();
     let ret_type = match ctx.state().create_logical_plan(&sub_sql).await {
         Ok(plan) => plan.schema().field(0).data_type().clone(),
         Err(_) => DataType::Null,
@@ -201,7 +346,17 @@ async fn register_udf(
             "udf body not executed".to_string(),
         ))
     };
-    let udf = create_udf(name, arg_types, ret_type, Volatility::Volatile, Arc::new(fun));
+    let signature = if arg_count == 0 {
+        Signature::nullary(Volatility::Volatile)
+    } else {
+        Signature::variadic_any(Volatility::Volatile)
+    };
+    let udf = ScalarUDF::from(SimpleScalarUDF::new_with_signature(
+        name,
+        signature,
+        ret_type,
+        Arc::new(fun),
+    ));
     ctx.register_udf(udf);
     Ok(())
 }
@@ -215,6 +370,7 @@ mod tests {
     use std::sync::Arc;
     use datafusion::datasource::MemTable;
     use datafusion::catalog::memory::MemorySchemaProvider;
+    use datafusion::logical_expr::create_udf;
     use arrow::record_batch::RecordBatch;
     use arrow::array::{StringArray, Int32Array, BooleanArray};
     use arrow::datatypes::{Schema, Field, DataType};
@@ -569,27 +725,24 @@ mod tests {
         let mut rewritten = stmt.to_string();
         rewritten = rewritten.replace("::oid", "");
 
-        // override generated UDFs with simple implementations
-        let udf_default = create_udf(
+        // override generated UDFs with simple implementations accepting any arguments
+        let udf_default = ScalarUDF::from(SimpleScalarUDF::new_with_signature(
             "__subq0",
-            vec![],
+            Signature::variadic_any(Volatility::Immutable),
             DataType::Utf8,
-            Volatility::Immutable,
-            Arc::new(|_| Ok(ColumnarValue::Scalar(datafusion::scalar::ScalarValue::Utf8(None)))));
+            Arc::new(|_| Ok(ColumnarValue::Scalar(datafusion::scalar::ScalarValue::Utf8(None))))));
         ctx.register_udf(udf_default);
-        let udf_primary = create_udf(
+        let udf_primary = ScalarUDF::from(SimpleScalarUDF::new_with_signature(
             "__subq1",
-            vec![],
+            Signature::nullary(Volatility::Immutable),
             DataType::Boolean,
-            Volatility::Immutable,
-            Arc::new(|_| Ok(ColumnarValue::Scalar(datafusion::scalar::ScalarValue::Boolean(Some(true))))));
+            Arc::new(|_| Ok(ColumnarValue::Scalar(datafusion::scalar::ScalarValue::Boolean(Some(true)))))));
         ctx.register_udf(udf_primary);
-        let udf_unique = create_udf(
+        let udf_unique = ScalarUDF::from(SimpleScalarUDF::new_with_signature(
             "__subq2",
-            vec![],
+            Signature::nullary(Volatility::Immutable),
             DataType::Boolean,
-            Volatility::Immutable,
-            Arc::new(|_| Ok(ColumnarValue::Scalar(datafusion::scalar::ScalarValue::Boolean(Some(true))))));
+            Arc::new(|_| Ok(ColumnarValue::Scalar(datafusion::scalar::ScalarValue::Boolean(Some(true)))))));
         ctx.register_udf(udf_unique);
 
         let df = ctx.sql(&rewritten).await?;
@@ -620,5 +773,52 @@ mod tests {
         assert!(isunique);
 
         Ok(())
+    }
+
+    #[test]
+    fn find_correlated_qualified() {
+        let sql = "SELECT * FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.id = t1.id)";
+        let mut stmt = Parser::parse_sql(&GenericDialect {}, sql).unwrap().remove(0);
+        if let Statement::Query(q) = stmt {
+            if let SetExpr::Select(sel) = q.body.as_ref() {
+                if let Some(Expr::Exists { subquery, .. }) = &sel.selection {
+                    let cols = find_correlated_columns(subquery);
+                    let vals: Vec<_> = cols.iter().map(|(e, _)| e.to_string()).collect();
+                    assert_eq!(vals, vec!["t1.id"]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn find_correlated_multiple() {
+        let sql = "SELECT * FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.id = t1.id AND t2.x = t1.x)";
+        let stmt = Parser::parse_sql(&GenericDialect {}, sql).unwrap().remove(0);
+        if let Statement::Query(q) = stmt {
+            if let SetExpr::Select(sel) = q.body.as_ref() {
+                if let Some(Expr::Exists { subquery, .. }) = &sel.selection {
+                    let mut vals: Vec<_> = find_correlated_columns(subquery)
+                        .into_iter()
+                        .map(|(e, _)| e.to_string())
+                        .collect();
+                    vals.sort();
+                    assert_eq!(vals, vec!["t1.id", "t1.x"]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn find_correlated_nested_ignore_inner() {
+        let sql = "SELECT * FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE EXISTS (SELECT 1 FROM t3 WHERE t3.id = t2.id AND t3.v = t1.v))";
+        let mut stmt = Parser::parse_sql(&GenericDialect {}, sql).unwrap().remove(0);
+        if let Statement::Query(q) = stmt {
+            if let SetExpr::Select(sel) = q.body.as_ref() {
+                if let Some(Expr::Exists { subquery, .. }) = &sel.selection {
+                    let cols = find_correlated_columns(subquery);
+                    assert!(cols.is_empty());
+                }
+            }
+        }
     }
 }
