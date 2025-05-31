@@ -1,0 +1,11 @@
+[package]
+name = "df_subquery_udf"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+datafusion = { version = "47.0.0", default-features = false, features = ["avro", "parquet"] }
+arrow      = "55.1.0"
+sqlparser  = "0.46.0"
+tokio      = { version = "1.43.1", features = ["rt-multi-thread", "macros"] }
+futures    = "0.3"
