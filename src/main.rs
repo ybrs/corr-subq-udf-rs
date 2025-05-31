@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use arrow::datatypes::DataType;
 use datafusion::logical_expr::{create_udf, ColumnarValue, Volatility};
-use datafusion::prelude::*;
+use datafusion::prelude::SessionContext;
 use sqlparser::ast::*;
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -134,12 +134,12 @@ async fn transform_expr(
                 replace_with_fn_call(expr, fn_name, &cols);
             }
         }
-        Expr::Exists(q) => {
-            let cols = find_correlated_columns(q);
+        Expr::Exists { subquery, .. } => {
+            let cols = find_correlated_columns(subquery);
             if !cols.is_empty() {
                 let fn_name = format!("__subq{}", *counter);
                 *counter += 1;
-                let exist_sql = format!("SELECT EXISTS ({})", q.to_string());
+                let exist_sql = format!("SELECT EXISTS ({})", subquery.to_string());
                 register_udf(ctx, &fn_name, exist_sql, &cols).await?;
                 replace_with_fn_call(expr, fn_name, &cols);
             }
@@ -150,17 +150,25 @@ async fn transform_expr(
 }
 
 fn replace_with_fn_call(expr: &mut Expr, fn_name: String, cols: &[(Ident, DataType)]) {
-    let args = cols
+    let args: Vec<FunctionArg> = cols
         .iter()
-        .map(|(id, _)| Expr::Identifier(id.clone()))
-        .map(FunctionArg::Unnamed)
+        .map(|(id, _)| {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Identifier(id.clone())))
+        })
         .collect();
     *expr = Expr::Function(Function {
-        name: ObjectName(vec![Ident::new(fn_name)]),
-        args,
+        name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new(fn_name))]),
+        uses_odbc_syntax: false,
+        parameters: FunctionArguments::None,
+        args: FunctionArguments::List(FunctionArgumentList {
+            duplicate_treatment: None,
+            args,
+            clauses: vec![],
+        }),
+        filter: None,
+        null_treatment: None,
         over: None,
-        distinct: false,
-        special: false,
+        within_group: vec![],
     });
 }
 
@@ -175,8 +183,9 @@ async fn register_udf(
     cols: &[(Ident, DataType)],
 ) -> datafusion::error::Result<()> {
     let arg_types: Vec<DataType> = cols.iter().map(|(_, t)| t.clone()).collect();
-    let plan = ctx.state().create_logical_plan(&sub_sql)?;
+    let plan = ctx.state().create_logical_plan(&sub_sql).await?;
     let ret_type = plan.schema().field(0).data_type().clone();
+    let ret_type_closure = ret_type.clone();
     let ctx_ref = Arc::new(ctx.clone());
     let template = sub_sql.clone();
     let fun = move |args: &[ColumnarValue]| {
@@ -188,13 +197,14 @@ async fn register_udf(
             };
             q = q.replace(&format!("${}", i + 1), &v);
         }
+        let ret_type = ret_type_closure.clone();
         futures::executor::block_on(async {
             let batch = ctx_ref.sql(&q).await?.collect().await?;
             if ret_type == DataType::Boolean {
                 let rows = batch.iter().map(|b| b.num_rows()).sum::<usize>() > 0;
                 Ok(ColumnarValue::Scalar(datafusion::scalar::ScalarValue::Boolean(Some(rows))))
             } else {
-                let val = batch[0].column(0).get_scalar(0)?;
+                let val = datafusion::scalar::ScalarValue::try_from_array(batch[0].column(0).as_ref(), 0)?;
                 Ok(ColumnarValue::Scalar(val))
             }
         })
@@ -209,7 +219,7 @@ mod tests {
     use super::*;
     use sqlparser::dialect::GenericDialect;
     use sqlparser::parser::Parser;
-    use datafusion::prelude::*;
+    use datafusion::prelude::SessionContext;
 
     #[tokio::test]
     async fn transform_exists_subquery() -> datafusion::error::Result<()> {
