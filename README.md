@@ -28,3 +28,11 @@ async fn main() -> datafusion::error::Result<()> {
 ```
 
 The repository contains functional tests showing a complete in-memory example.
+
+## Development Notes
+
+The test suite now checks handling of fully qualified column names. The
+`find_correlated_columns` function inspects identifier parts to detect
+references to outer queries. It now examines the table component of compound
+identifiers so expressions like `schema.table.col` are not incorrectly treated
+as correlated when `table` is a local source.

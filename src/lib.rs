@@ -190,8 +190,8 @@ fn find_correlated_columns(q: &Query) -> Vec<(Expr, DataType)> {
             TableFactor::Table { name, alias, .. } => {
                 if let Some(a) = alias {
                     out.insert(a.name.value.clone());
-                } else {
-                    out.insert(name.to_string());
+                } else if let Some(last) = name.0.last().and_then(|p| p.as_ident()) {
+                    out.insert(last.value.clone());
                 }
             }
             TableFactor::Derived { alias, .. } => {
@@ -228,8 +228,9 @@ fn find_correlated_columns(q: &Query) -> Vec<(Expr, DataType)> {
                 // without schema information we ignore them.
             }
             Expr::CompoundIdentifier(idents) => {
-                if let Some(first) = idents.first() {
-                    if !aliases.contains(&first.value) {
+                let alias_idx = if idents.len() >= 2 { idents.len() - 2 } else { 0 };
+                if let Some(ident) = idents.get(alias_idx) {
+                    if !aliases.contains(&ident.value) {
                         cols.entry(expr.to_string())
                             .or_insert_with(|| Expr::CompoundIdentifier(idents.clone()));
                     }
@@ -819,6 +820,16 @@ mod tests {
                     assert!(cols.is_empty());
                 }
             }
+        }
+    }
+
+    #[test]
+    fn find_correlated_fully_qualified_local() {
+        let sql = "SELECT 1 FROM schema1.t1 WHERE schema1.t1.id = 1";
+        let stmt = Parser::parse_sql(&GenericDialect {}, sql).unwrap().remove(0);
+        if let Statement::Query(q) = stmt {
+            let cols = find_correlated_columns(&q);
+            assert!(cols.is_empty());
         }
     }
 }
