@@ -3,6 +3,9 @@ name = "df_subquery_udf"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+path = "src/lib.rs"
+
 [dependencies]
 datafusion = { version = "47.0.0", default-features = false, features = ["avro", "parquet"] }
 arrow      = "55.1.0"
