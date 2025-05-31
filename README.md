@@ -1,8 +1,11 @@
-# df_subquery_udf
+# Correlated Subqueries to UDFs
 
-This example demonstrates rewriting correlated subqueries into
-user defined functions using DataFusion 47.  The code registers each
-subquery as a UDF and replaces the expression with a function call.
+This project demonstrates how correlated subqueries can be rewritten into
+user-defined functions (UDFs) using [DataFusion](https://github.com/apache/arrow-datafusion).
+The main program parses an input SQL statement, detects correlated subqueries,
+and registers UDFs that implement the subqueries. These UDFs are then invoked
+in the rewritten SQL so it can be executed by DataFusion.
 
-The repository was updated to compile with DataFusion 47 and
-sqlparser 0.55.  Tests ensure the transformation pipeline works.
+The repository provides a minimal example of the transformation logic and shows
+how custom UDFs can be created at runtime to handle complex queries.
+
