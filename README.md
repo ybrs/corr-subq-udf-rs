@@ -1,12 +1,30 @@
 # Correlated Subqueries to UDFs
 
-This project demonstrates how correlated subqueries can be rewritten into
-user-defined functions (UDFs) using [DataFusion](https://github.com/apache/arrow-datafusion).
-The main program parses an input SQL statement, detects correlated subqueries,
-and registers UDFs that implement the subqueries. These UDFs are then invoked
-in the rewritten SQL so it can be executed by DataFusion.
+This project demonstrates how correlated subqueries can be rewritten into user defined functions (UDFs) using [DataFusion](https://github.com/apache/arrow-datafusion).
+The library exposes a helper that walks a SQL query, registers UDFs representing subqueries and returns a rewritten SQL string.
 
-The repository provides a minimal example of the transformation logic and shows
-how custom UDFs can be created at runtime to handle complex queries.
+## Using in other projects
 
-\n## Functional Tests\nAdded example memtable-based functional test for the large query. Subqueries are rewritten to UDFs and executed against sample data.
+The crate is not published on crates.io. To use it in your own project add a git dependency in `Cargo.toml`:
+
+```toml
+# Cargo.toml
+df_subquery_udf = { git = "https://github.com/ybrs/corr-subq-udf-rs" }
+```
+
+Then call [`rewrite_query`](src/lib.rs) to transform your SQL:
+
+```rust
+use df_subquery_udf::rewrite_query;
+use datafusion::prelude::SessionContext;
+
+#[tokio::main]
+async fn main() -> datafusion::error::Result<()> {
+    let mut ctx = SessionContext::new();
+    let sql = "select 1 where exists(select 1)";
+    let rewritten = rewrite_query(sql, &mut ctx).await?;
+    ctx.sql(&rewritten).await?.show().await
+}
+```
+
+The repository contains functional tests showing a complete in-memory example.
