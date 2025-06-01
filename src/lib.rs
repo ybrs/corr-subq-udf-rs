@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
 use futures::future::BoxFuture;
 use arrow::datatypes::DataType;
 use datafusion::logical_expr::{
@@ -9,6 +9,8 @@ use datafusion::prelude::SessionContext;
 use sqlparser::ast::*;
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
+
+static NEXT_UDF_ID: AtomicUsize = AtomicUsize::new(0);
 
 /// Rewrite correlated subqueries in `sql` into UDF calls and register those UDFs
 /// in `ctx`. The rewritten SQL string is returned.
@@ -24,12 +26,12 @@ use sqlparser::parser::Parser;
 pub async fn rewrite_query(
     sql: &str,
     ctx: &mut SessionContext,
-) -> datafusion::error::Result<String> {
+) -> datafusion::error::Result<(String, Vec<String>)> {
     let dialect = GenericDialect {};
     let mut stmt = Parser::parse_sql(&dialect, sql)?.remove(0);
-    let mut counter = 0;
-    transform_statement(&mut stmt, ctx, &mut counter).await?;
-    Ok(stmt.to_string())
+    let mut names = Vec::new();
+    transform_statement(&mut stmt, ctx, &mut names).await?;
+    Ok((stmt.to_string(), names))
 }
 
 /// Convenience helper that rewrites and immediately executes the query.
@@ -37,17 +39,21 @@ pub async fn rewrite_and_exec(
     sql: &str,
     ctx: &mut SessionContext,
 ) -> datafusion::error::Result<()> {
-    let rewritten = rewrite_query(sql, ctx).await?;
-    ctx.sql(&rewritten).await?.show().await
+    let (rewritten, names) = rewrite_query(sql, ctx).await?;
+    ctx.sql(&rewritten).await?.show().await?;
+    for name in names {
+        ctx.deregister_udf(&name);
+    }
+    Ok(())
 }
 
 async fn transform_statement(
     stmt: &mut Statement,
     ctx: &mut SessionContext,
-    counter: &mut usize,
+    names: &mut Vec<String>,
 ) -> datafusion::error::Result<()> {
     if let Statement::Query(q) = stmt {
-        transform_setexpr(&mut q.body, ctx, counter).await?;
+        transform_setexpr(&mut q.body, ctx, names).await?;
     }
     Ok(())
 }
@@ -55,22 +61,22 @@ async fn transform_statement(
 async fn transform_setexpr(
     sexpr: &mut SetExpr,
     ctx: &mut SessionContext,
-    counter: &mut usize,
+    names: &mut Vec<String>,
 ) -> datafusion::error::Result<()> {
     if let SetExpr::Select(s) = sexpr {
         for item in &mut s.projection {
             match item {
                 SelectItem::UnnamedExpr(e) => {
-                    transform_expr(e, ctx, counter).await?;
+                    transform_expr(e, ctx, names).await?;
                 }
                 SelectItem::ExprWithAlias { expr, .. } => {
-                    transform_expr(expr, ctx, counter).await?;
+                    transform_expr(expr, ctx, names).await?;
                 }
                 _ => {}
             }
         }
         if let Some(e) = &mut s.selection {
-            transform_expr(e, ctx, counter).await?;
+            transform_expr(e, ctx, names).await?;
         }
     }
     Ok(())
@@ -79,34 +85,36 @@ async fn transform_setexpr(
 fn transform_expr<'a>(
     expr: &'a mut Expr,
     ctx: &'a mut SessionContext,
-    counter: &'a mut usize,
+    names: &'a mut Vec<String>,
 ) -> BoxFuture<'a, datafusion::error::Result<()>> {
     Box::pin(async move {
         match expr {
             Expr::Subquery(q) => {
                 let cols = find_correlated_columns(q);
-                let fn_name = format!("__subq{}", *counter);
-                *counter += 1;
+                let id = NEXT_UDF_ID.fetch_add(1, Ordering::SeqCst);
+                let fn_name = format!("__subq{}", id);
                 register_udf(ctx, &fn_name, q.to_string(), &cols).await?;
+                names.push(fn_name.clone());
                 replace_with_fn_call(expr, fn_name, &cols);
             }
             Expr::Exists { subquery, .. } => {
                 let cols = find_correlated_columns(subquery);
-                let fn_name = format!("__subq{}", *counter);
-                *counter += 1;
+                let id = NEXT_UDF_ID.fetch_add(1, Ordering::SeqCst);
+                let fn_name = format!("__subq{}", id);
                 let exist_sql = format!("SELECT EXISTS ({})", subquery.to_string());
                 register_udf(ctx, &fn_name, exist_sql, &cols).await?;
+                names.push(fn_name.clone());
                 replace_with_fn_call(expr, fn_name, &cols);
             }
             Expr::BinaryOp { left, right, .. } => {
-                transform_expr(left, ctx, counter).await?;
-                transform_expr(right, ctx, counter).await?;
+                transform_expr(left, ctx, names).await?;
+                transform_expr(right, ctx, names).await?;
             }
             Expr::UnaryOp { expr: inner, .. } => {
-                transform_expr(inner, ctx, counter).await?;
+                transform_expr(inner, ctx, names).await?;
             }
             Expr::Nested(inner) => {
-                transform_expr(inner, ctx, counter).await?;
+                transform_expr(inner, ctx, names).await?;
             }
             Expr::Case {
                 operand,
@@ -114,27 +122,27 @@ fn transform_expr<'a>(
                 else_result,
             } => {
                 if let Some(op) = operand {
-                    transform_expr(op, ctx, counter).await?;
+                    transform_expr(op, ctx, names).await?;
                 }
                 for when in conditions.iter_mut() {
-                    transform_expr(&mut when.condition, ctx, counter).await?;
-                    transform_expr(&mut when.result, ctx, counter).await?;
+                    transform_expr(&mut when.condition, ctx, names).await?;
+                    transform_expr(&mut when.result, ctx, names).await?;
                 }
                 if let Some(er) = else_result {
-                    transform_expr(er, ctx, counter).await?;
+                    transform_expr(er, ctx, names).await?;
                 }
             }
             Expr::Function(f) => match &mut f.args {
                 FunctionArguments::List(list) => {
                     for arg in &mut list.args {
                         if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) = arg {
-                            transform_expr(e, ctx, counter).await?;
+                            transform_expr(e, ctx, names).await?;
                         }
                     }
                 }
                 FunctionArguments::Subquery(q) => {
                     let mut stmt = Statement::Query(q.clone());
-                    transform_statement(&mut stmt, ctx, counter).await?;
+                    transform_statement(&mut stmt, ctx, names).await?;
                     if let Statement::Query(q_new) = stmt {
                         *q = q_new;
                     }
@@ -146,11 +154,12 @@ fn transform_expr<'a>(
                 expr: inner,
                 ..
             } => {
-                transform_expr(inner, ctx, counter).await?;
+                transform_expr(inner, ctx, names).await?;
                 let cols = find_correlated_columns(subquery);
-                let fn_name = format!("__subq{}", *counter);
-                *counter += 1;
+                let id = NEXT_UDF_ID.fetch_add(1, Ordering::SeqCst);
+                let fn_name = format!("__subq{}", id);
                 register_udf(ctx, &fn_name, subquery.to_string(), &cols).await?;
+                names.push(fn_name.clone());
                 replace_with_fn_call(expr, fn_name, &cols);
             }
             _ => {}
@@ -382,8 +391,8 @@ mod tests {
         let dialect = GenericDialect {};
         let mut stmt = Parser::parse_sql(&dialect, sql)?.remove(0);
         let mut ctx = SessionContext::new();
-        let mut counter = 0;
-        transform_statement(&mut stmt, &mut ctx, &mut counter).await?;
+        let mut names = Vec::new();
+        transform_statement(&mut stmt, &mut ctx, &mut names).await?;
         Ok(())
     }
 
@@ -458,7 +467,7 @@ mod tests {
           AND  NOT attisdropped
         ORDER BY attnum;
         "#;
-        let rewritten = rewrite_query(sql, &mut SessionContext::new()).await?;
+        let (rewritten, _) = rewrite_query(sql, &mut SessionContext::new()).await?;
         let count = rewritten.matches("__subq").count();
         assert_eq!(
             count, 3,
@@ -721,26 +730,26 @@ mod tests {
         ORDER BY attnum;
         "#;
         let mut stmt = Parser::parse_sql(&GenericDialect{}, sql)?.remove(0);
-        let mut counter = 0;
-        transform_statement(&mut stmt, &mut ctx, &mut counter).await?;
+        let mut names = Vec::new();
+        transform_statement(&mut stmt, &mut ctx, &mut names).await?;
         let mut rewritten = stmt.to_string();
         rewritten = rewritten.replace("::oid", "");
 
         // override generated UDFs with simple implementations accepting any arguments
         let udf_default = ScalarUDF::from(SimpleScalarUDF::new_with_signature(
-            "__subq0",
+            &names[0],
             Signature::variadic_any(Volatility::Immutable),
             DataType::Utf8,
             Arc::new(|_| Ok(ColumnarValue::Scalar(datafusion::scalar::ScalarValue::Utf8(None))))));
         ctx.register_udf(udf_default);
         let udf_primary = ScalarUDF::from(SimpleScalarUDF::new_with_signature(
-            "__subq1",
+            &names[1],
             Signature::nullary(Volatility::Immutable),
             DataType::Boolean,
             Arc::new(|_| Ok(ColumnarValue::Scalar(datafusion::scalar::ScalarValue::Boolean(Some(true)))))));
         ctx.register_udf(udf_primary);
         let udf_unique = ScalarUDF::from(SimpleScalarUDF::new_with_signature(
-            "__subq2",
+            &names[2],
             Signature::nullary(Volatility::Immutable),
             DataType::Boolean,
             Arc::new(|_| Ok(ColumnarValue::Scalar(datafusion::scalar::ScalarValue::Boolean(Some(true)))))));
@@ -831,5 +840,21 @@ mod tests {
             let cols = find_correlated_columns(&q);
             assert!(cols.is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn register_and_cleanup_udfs() -> datafusion::error::Result<()> {
+        let mut ctx = SessionContext::new();
+        let before = ctx.state_ref().read().scalar_functions().len();
+        let sql = "SELECT 1 WHERE EXISTS(SELECT 1)";
+        let (_rewritten, names) = rewrite_query(sql, &mut ctx).await?;
+        let during = ctx.state_ref().read().scalar_functions().len();
+        assert!(during > before);
+        for n in &names {
+            ctx.deregister_udf(n);
+        }
+        let after = ctx.state_ref().read().scalar_functions().len();
+        assert_eq!(before, after);
+        Ok(())
     }
 }
