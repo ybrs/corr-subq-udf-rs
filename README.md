@@ -22,8 +22,12 @@ use datafusion::prelude::SessionContext;
 async fn main() -> datafusion::error::Result<()> {
     let mut ctx = SessionContext::new();
     let sql = "select 1 where exists(select 1)";
-    let rewritten = rewrite_query(sql, &mut ctx).await?;
-    ctx.sql(&rewritten).await?.show().await
+    let (rewritten, udfs) = rewrite_query(sql, &mut ctx).await?;
+    ctx.sql(&rewritten).await?.show().await?;
+    for name in udfs {
+        ctx.deregister_udf(&name);
+    }
+    Ok(())
 }
 ```
 
