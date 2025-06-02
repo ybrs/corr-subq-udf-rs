@@ -347,14 +347,78 @@ async fn register_udf(
     cols: &[(Expr, DataType)],
 ) -> datafusion::error::Result<()> {
     let arg_count = cols.len();
-    let ret_type = match ctx.state().create_logical_plan(&sub_sql).await {
-        Ok(plan) => plan.schema().field(0).data_type().clone(),
-        Err(_) => DataType::Null,
+    let trimmed = sub_sql.trim();
+    let is_exists = trimmed.to_uppercase().starts_with("SELECT EXISTS");
+    let inner_sql = if is_exists {
+        let start = trimmed.find('(').unwrap_or(0) + 1;
+        let end = trimmed.rfind(')').unwrap_or(trimmed.len());
+        trimmed[start..end].to_string()
+    } else {
+        trimmed.to_string()
     };
-    let fun = |_args: &[ColumnarValue]| {
-        Err(datafusion::error::DataFusionError::NotImplemented(
-            "udf body not executed".to_string(),
-        ))
+    let ret_type = if is_exists {
+        DataType::Boolean
+    } else {
+        match ctx.state().create_logical_plan(&inner_sql).await {
+            Ok(plan) => plan.schema().field(0).data_type().clone(),
+            Err(_) => DataType::Null,
+        }
+    };
+    // precompute string representations of the correlated expressions
+    let expr_strings: Vec<String> = cols.iter().map(|(e, _)| e.to_string()).collect();
+    let ctx_clone = ctx.clone();
+    let fun = move |args: &[ColumnarValue]| {
+        // determine number of rows to process
+        let len = args
+            .iter()
+            .filter_map(|c| match c {
+                ColumnarValue::Array(a) => Some(a.len()),
+                _ => None,
+            })
+            .next()
+            .unwrap_or(1);
+        let mut results = Vec::with_capacity(len);
+        for row in 0..len {
+            // build query with parameter values substituted
+            let mut q = inner_sql.clone();
+            for (expr_str, arg) in expr_strings.iter().zip(args.iter()) {
+                let scalar = match arg {
+                    ColumnarValue::Scalar(s) => s.clone(),
+                    ColumnarValue::Array(arr) => {
+                        datafusion::scalar::ScalarValue::try_from_array(arr, row)?
+                    }
+                };
+                let val = scalar_to_sql(&scalar);
+                q = q.replace(expr_str, &val);
+            }
+            let ctx_inner = ctx_clone.clone();
+            let q_clone = q.clone();
+            let handle = std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(async move {
+                    let df = ctx_inner.sql(&q_clone).await?;
+                    let batches = df.collect().await?;
+                    if is_exists {
+                        let exists = batches.iter().any(|b| b.num_rows() > 0);
+                        Ok(datafusion::scalar::ScalarValue::Boolean(Some(exists)))
+                    } else if batches.is_empty() || batches[0].num_rows() == 0 {
+                        Ok(datafusion::scalar::ScalarValue::Null)
+                    } else {
+                        datafusion::scalar::ScalarValue::try_from_array(
+                            batches[0].column(0).as_ref(),
+                            0,
+                        )
+                    }
+                })
+            });
+            let val = handle.join().expect("thread panicked")?;
+            results.push(val);
+        }
+        let array = datafusion::scalar::ScalarValue::iter_to_array(results)?;
+        Ok(ColumnarValue::Array(array))
     };
     let signature = if arg_count == 0 {
         Signature::nullary(Volatility::Volatile)
@@ -369,6 +433,25 @@ async fn register_udf(
     ));
     ctx.register_udf(udf);
     Ok(())
+}
+
+fn scalar_to_sql(value: &datafusion::scalar::ScalarValue) -> String {
+    use datafusion::scalar::ScalarValue as SV;
+    match value {
+        SV::Boolean(Some(v)) => v.to_string(),
+        SV::Int8(Some(v)) => v.to_string(),
+        SV::Int16(Some(v)) => v.to_string(),
+        SV::Int32(Some(v)) => v.to_string(),
+        SV::Int64(Some(v)) => v.to_string(),
+        SV::UInt8(Some(v)) => v.to_string(),
+        SV::UInt16(Some(v)) => v.to_string(),
+        SV::UInt32(Some(v)) => v.to_string(),
+        SV::UInt64(Some(v)) => v.to_string(),
+        SV::Float32(Some(v)) => v.to_string(),
+        SV::Float64(Some(v)) => v.to_string(),
+        SV::Utf8(Some(s)) | SV::LargeUtf8(Some(s)) => format!("'{}'", s.replace("'", "''")),
+        _ => "NULL".to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -782,6 +865,39 @@ mod tests {
             .value(0);
         assert!(isunique);
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn correlated_subquery_exec() -> datafusion::error::Result<()> {
+        let mut ctx = SessionContext::new();
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2]))],
+        )?;
+        let batch2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![2]))],
+        )?;
+        let t1 = MemTable::try_new(schema.clone(), vec![vec![batch1]])?;
+        let t2 = MemTable::try_new(schema, vec![vec![batch2]])?;
+        ctx.register_table("t1", Arc::new(t1))?;
+        ctx.register_table("t2", Arc::new(t2))?;
+
+        let sql = "SELECT id FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.id = t1.id)";
+        let (rewritten, names) = rewrite_query(sql, &mut ctx).await?;
+        let df = ctx.sql(&rewritten).await?;
+        let batches = df.collect().await?;
+        assert_eq!(batches[0].num_rows(), 1);
+        let val = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(val, 2);
+        for n in names { ctx.deregister_udf(&n); }
         Ok(())
     }
 

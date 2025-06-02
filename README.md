@@ -68,3 +68,6 @@ The test suite now checks handling of fully qualified column names. The
 references to outer queries. It now examines the table component of compound
 identifiers so expressions like `schema.table.col` are not incorrectly treated
 as correlated when `table` is a local source.
+
+## Notes
+Implemented minimal execution for generated subquery UDFs. Each UDF now runs its stored query in a separate thread and substitutes parameters before execution. Tests verify that correlated subqueries return expected values.
