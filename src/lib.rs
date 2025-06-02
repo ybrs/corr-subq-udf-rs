@@ -5,6 +5,7 @@ use datafusion::logical_expr::{
     ColumnarValue, Volatility, Signature, ScalarUDF,
     expr_fn::SimpleScalarUDF,
 };
+use datafusion::scalar::ScalarValue;
 use datafusion::prelude::SessionContext;
 use sqlparser::ast::*;
 use sqlparser::dialect::GenericDialect;
@@ -93,7 +94,7 @@ fn transform_expr<'a>(
                 let cols = find_correlated_columns(q);
                 let id = NEXT_UDF_ID.fetch_add(1, Ordering::SeqCst);
                 let fn_name = format!("__subq{}", id);
-                register_udf(ctx, &fn_name, q.to_string(), &cols).await?;
+                register_udf(ctx, &fn_name, q.to_string(), &cols, false).await?;
                 names.push(fn_name.clone());
                 replace_with_fn_call(expr, fn_name, &cols);
             }
@@ -101,8 +102,8 @@ fn transform_expr<'a>(
                 let cols = find_correlated_columns(subquery);
                 let id = NEXT_UDF_ID.fetch_add(1, Ordering::SeqCst);
                 let fn_name = format!("__subq{}", id);
-                let exist_sql = format!("SELECT EXISTS ({})", subquery.to_string());
-                register_udf(ctx, &fn_name, exist_sql, &cols).await?;
+                let exist_sql = subquery.to_string();
+                register_udf(ctx, &fn_name, exist_sql, &cols, true).await?;
                 names.push(fn_name.clone());
                 replace_with_fn_call(expr, fn_name, &cols);
             }
@@ -158,7 +159,7 @@ fn transform_expr<'a>(
                 let cols = find_correlated_columns(subquery);
                 let id = NEXT_UDF_ID.fetch_add(1, Ordering::SeqCst);
                 let fn_name = format!("__subq{}", id);
-                register_udf(ctx, &fn_name, subquery.to_string(), &cols).await?;
+                register_udf(ctx, &fn_name, subquery.to_string(), &cols, false).await?;
                 names.push(fn_name.clone());
                 replace_with_fn_call(expr, fn_name, &cols);
             }
@@ -345,17 +346,203 @@ async fn register_udf(
     name: &str,
     sub_sql: String,
     cols: &[(Expr, DataType)],
+    is_exists: bool,
 ) -> datafusion::error::Result<()> {
     let arg_count = cols.len();
-    let ret_type = match ctx.state().create_logical_plan(&sub_sql).await {
-        Ok(plan) => plan.schema().field(0).data_type().clone(),
-        Err(_) => DataType::Null,
+
+    // replace correlated columns with placeholders like $1, $2
+    let dialect = GenericDialect {};
+    let mut stmt = Parser::parse_sql(&dialect, &sub_sql)?.remove(0);
+    if let Statement::Query(q) = &mut stmt {
+        fn replace_expr(expr: &mut Expr, targets: &[(String, String)]) {
+            for (src, placeholder) in targets {
+                if expr.to_string() == *src {
+                    *expr = Expr::Value(Value::Placeholder(placeholder.clone()).into());
+                    return;
+                }
+            }
+            match expr {
+                Expr::BinaryOp { left, right, .. } => {
+                    replace_expr(left, targets);
+                    replace_expr(right, targets);
+                }
+                Expr::UnaryOp { expr: inner, .. } => replace_expr(inner, targets),
+                Expr::Nested(inner) => replace_expr(inner, targets),
+                Expr::Function(f) => match &mut f.args {
+                    FunctionArguments::List(list) => {
+                        for arg in &mut list.args {
+                            if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) = arg {
+                                replace_expr(e, targets);
+                            }
+                        }
+                    }
+                    FunctionArguments::Subquery(q) => {
+                        if let SetExpr::Select(sel) = q.body.as_mut() {
+                            for item in &mut sel.projection {
+                                if let SelectItem::UnnamedExpr(e)
+                                | SelectItem::ExprWithAlias { expr: e, .. } = item
+                                {
+                                    replace_expr(e, targets);
+                                }
+                            }
+                            if let Some(w) = &mut sel.selection {
+                                replace_expr(w, targets);
+                            }
+                        }
+                    }
+                FunctionArguments::None => {}
+                },
+                Expr::Exists { subquery, .. } => {
+                    if let SetExpr::Select(sel) = subquery.body.as_mut() {
+                        if let Some(selection) = &mut sel.selection {
+                            replace_expr(selection, targets);
+                        }
+                        for item in &mut sel.projection {
+                            if let SelectItem::UnnamedExpr(e)
+                                | SelectItem::ExprWithAlias { expr: e, .. } = item
+                            {
+                                replace_expr(e, targets);
+                            }
+                        }
+                    }
+                }
+                Expr::Subquery(q) => {
+                    if let SetExpr::Select(sel) = q.body.as_mut() {
+                        if let Some(selection) = &mut sel.selection {
+                            replace_expr(selection, targets);
+                        }
+                        for item in &mut sel.projection {
+                            if let SelectItem::UnnamedExpr(e)
+                                | SelectItem::ExprWithAlias { expr: e, .. } = item
+                            {
+                                replace_expr(e, targets);
+                            }
+                        }
+                    }
+                }
+                Expr::InSubquery { subquery, expr: inner, .. } => {
+                    replace_expr(inner, targets);
+                    if let SetExpr::Select(sel) = subquery.body.as_mut() {
+                        if let Some(selection) = &mut sel.selection {
+                            replace_expr(selection, targets);
+                        }
+                        for item in &mut sel.projection {
+                            if let SelectItem::UnnamedExpr(e)
+                                | SelectItem::ExprWithAlias { expr: e, .. } = item
+                            {
+                                replace_expr(e, targets);
+                            }
+                        }
+                    }
+                }
+                Expr::InList { expr: inner, list, .. } => {
+                    replace_expr(inner, targets);
+                    for e in list {
+                        replace_expr(e, targets);
+                    }
+                }
+                Expr::Between { expr: inner, low, high, .. } => {
+                    replace_expr(inner, targets);
+                    replace_expr(low, targets);
+                    replace_expr(high, targets);
+                }
+                Expr::Case { operand, conditions, else_result, .. } => {
+                    if let Some(op) = operand {
+                        replace_expr(op, targets);
+                    }
+                    for when in conditions {
+                        replace_expr(&mut when.condition, targets);
+                        replace_expr(&mut when.result, targets);
+                    }
+                    if let Some(er) = else_result {
+                        replace_expr(er, targets);
+                    }
+                }
+                Expr::Cast { expr: inner, .. } => replace_expr(inner, targets),
+                Expr::Collate { expr: inner, .. } => replace_expr(inner, targets),
+                Expr::Substring { expr: inner, substring_from, substring_for, .. } => {
+                    replace_expr(inner, targets);
+                    if let Some(e) = substring_from {
+                        replace_expr(e, targets);
+                    }
+                    if let Some(e) = substring_for {
+                        replace_expr(e, targets);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let replacements: Vec<(String, String)> = cols
+            .iter()
+            .enumerate()
+            .map(|(i, (e, _))| (e.to_string(), format!("${}", i + 1)))
+            .collect();
+
+        if let SetExpr::Select(sel) = q.body.as_mut() {
+            if let Some(selection) = &mut sel.selection {
+                replace_expr(selection, &replacements);
+            }
+            for item in &mut sel.projection {
+                match item {
+                    SelectItem::UnnamedExpr(e) => replace_expr(e, &replacements),
+                    SelectItem::ExprWithAlias { expr, .. } => replace_expr(expr, &replacements),
+                    _ => {}
+                }
+            }
+            if let GroupByExpr::Expressions(exprs, _) = &mut sel.group_by {
+                for g in exprs {
+                    replace_expr(g, &replacements);
+                }
+            }
+            if let Some(h) = &mut sel.having {
+                replace_expr(h, &replacements);
+            }
+        }
+    }
+    let placeholder_sql = stmt.to_string();
+    println!("registering UDF {} with sql: {}", name, placeholder_sql);
+
+    let ret_type = if is_exists {
+        DataType::Boolean
+    } else {
+        match ctx.state().create_logical_plan(&placeholder_sql).await {
+            Ok(plan) => plan.schema().field(0).data_type().clone(),
+            Err(_) => DataType::Null,
+        }
     };
-    let fun = |_args: &[ColumnarValue]| {
-        Err(datafusion::error::DataFusionError::NotImplemented(
-            "udf body not executed".to_string(),
-        ))
+
+    let ctx_clone = ctx.clone();
+    let sql_clone = placeholder_sql.clone();
+    let ret_clone = ret_type.clone();
+
+    let fun = move |args: &[ColumnarValue]| {
+        futures::executor::block_on(async {
+            let arrays = ColumnarValue::values_to_arrays(args)?;
+            let len = arrays.first().map(|a| a.len()).unwrap_or(1);
+            let mut out_vals = Vec::with_capacity(len);
+            for row in 0..len {
+                let mut params = Vec::new();
+                for arr in &arrays {
+                    params.push(ScalarValue::try_from_array(arr, row)?);
+                }
+                let df = ctx_clone.sql(&sql_clone).await?;
+                let df = df.with_param_values(params)?;
+                let batches = df.collect().await?;
+                let value = if is_exists {
+                    ScalarValue::Boolean(Some(!batches.is_empty() && batches[0].num_rows() > 0))
+                } else if batches.is_empty() || batches[0].num_rows() == 0 {
+                    ScalarValue::try_from(&ret_clone)?
+                } else {
+                    ScalarValue::try_from_array(batches[0].column(0).as_ref(), 0)?
+                };
+                out_vals.push(value);
+            }
+            let array = ScalarValue::iter_to_array(out_vals.into_iter())?;
+            Ok(ColumnarValue::Array(array))
+        })
     };
+
     let signature = if arg_count == 0 {
         Signature::nullary(Volatility::Volatile)
     } else {
@@ -855,6 +1042,46 @@ mod tests {
         }
         let after = ctx.state_ref().read().scalar_functions().len();
         assert_eq!(before, after);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn udf_executes_subquery() -> datafusion::error::Result<()> {
+        let mut ctx = SessionContext::new();
+        // table t1
+        let schema1 = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch1 = RecordBatch::try_new(
+            schema1.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2]))],
+        )?;
+        let table1 = MemTable::try_new(schema1, vec![vec![batch1]])?;
+        ctx.register_table("t1", Arc::new(table1))?;
+
+        // table t2
+        let schema2 = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch2 = RecordBatch::try_new(
+            schema2.clone(),
+            vec![Arc::new(Int32Array::from(vec![2]))],
+        )?;
+        let table2 = MemTable::try_new(schema2, vec![vec![batch2]])?;
+        ctx.register_table("t2", Arc::new(table2))?;
+
+        let sql = "SELECT id FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.id = t1.id)";
+        let (rewritten, names) = rewrite_query(sql, &mut ctx).await?;
+        println!("rewritten: {}", rewritten);
+        let df = ctx.sql(&rewritten).await?;
+        let batches = df.collect().await?;
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 1);
+        let arr = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(arr.value(0), 2);
+        for n in names {
+            ctx.deregister_udf(&n);
+        }
         Ok(())
     }
 }
