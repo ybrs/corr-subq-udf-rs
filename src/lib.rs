@@ -351,10 +351,90 @@ async fn register_udf(
         Ok(plan) => plan.schema().field(0).data_type().clone(),
         Err(_) => DataType::Null,
     };
-    let fun = |_args: &[ColumnarValue]| {
-        Err(datafusion::error::DataFusionError::NotImplemented(
-            "udf body not executed".to_string(),
-        ))
+    let ctx_clone = ctx.clone();
+    let col_strs: Vec<String> = cols.iter().map(|(e, _)| e.to_string()).collect();
+    let fun = move |args: &[ColumnarValue]| {
+        use datafusion::scalar::ScalarValue;
+        use datafusion::error::{Result, DataFusionError};
+
+        // determine row count
+        let row_count = args
+            .iter()
+            .filter_map(|a| match a {
+                ColumnarValue::Array(arr) => Some(arr.len()),
+                _ => None,
+            })
+            .next()
+            .unwrap_or(1);
+
+        let mut results = Vec::with_capacity(row_count);
+        for row in 0..row_count {
+            let mut sql = sub_sql.clone();
+            for (idx, key) in col_strs.iter().enumerate() {
+                let val = match &args[idx] {
+                    ColumnarValue::Scalar(v) => v.clone(),
+                    ColumnarValue::Array(arr) => {
+                        ScalarValue::try_from_array(arr.as_ref(), row)?
+                    }
+                };
+                let replace = match &val {
+                    ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => {
+                        format!("'{}'", s.replace('\'', "''"))
+                    }
+                    ScalarValue::Boolean(Some(b)) => b.to_string(),
+                    ScalarValue::Int8(Some(v)) => v.to_string(),
+                    ScalarValue::Int16(Some(v)) => v.to_string(),
+                    ScalarValue::Int32(Some(v)) => v.to_string(),
+                    ScalarValue::Int64(Some(v)) => v.to_string(),
+                    ScalarValue::UInt8(Some(v)) => v.to_string(),
+                    ScalarValue::UInt16(Some(v)) => v.to_string(),
+                    ScalarValue::UInt32(Some(v)) => v.to_string(),
+                    ScalarValue::UInt64(Some(v)) => v.to_string(),
+                    _ => "NULL".to_string(),
+                };
+                sql = sql.replace(key, &replace);
+            }
+
+            let res: Result<ScalarValue> = std::thread::spawn({
+                let ctx_clone = ctx_clone.clone();
+                let sql = sql.clone();
+                move || {
+                    let rt = tokio::runtime::Runtime::new().map_err(|e| DataFusionError::Execution(e.to_string()))?;
+                    rt.block_on(async {
+                        let dialect = GenericDialect {};
+                        let mut stmt = Parser::parse_sql(&dialect, &sql).map_err(|e| DataFusionError::Execution(e.to_string()))?.remove(0);
+                        let (run_sql, exists_mode) = if let Statement::Query(q) = &stmt {
+                            if let SetExpr::Select(sel) = q.body.as_ref() {
+                                if sel.projection.len() == 1 {
+                                    if let SelectItem::UnnamedExpr(Expr::Exists { subquery, .. }) = &sel.projection[0] {
+                                        (subquery.to_string(), true)
+                                    } else {
+                                        (sql.clone(), false)
+                                    }
+                                } else {
+                                    (sql.clone(), false)
+                                }
+                            } else { (sql.clone(), false) }
+                        } else { (sql.clone(), false) };
+
+                        let df = ctx_clone.sql(&run_sql).await?;
+                        let batches = df.collect().await?;
+                        if exists_mode {
+                            let has = !batches.is_empty() && batches[0].num_rows() > 0;
+                            Ok(ScalarValue::Boolean(Some(has)))
+                        } else if batches.is_empty() || batches[0].num_rows() == 0 {
+                            Ok(ScalarValue::Null)
+                        } else {
+                            ScalarValue::try_from_array(batches[0].column(0).as_ref(), 0)
+                        }
+                    })
+                }
+            }).join().unwrap();
+            results.push(res?);
+        }
+
+        let array = ScalarValue::iter_to_array(results)?;
+        Ok(ColumnarValue::Array(array))
     };
     let signature = if arg_count == 0 {
         Signature::nullary(Volatility::Volatile)
@@ -384,6 +464,7 @@ mod tests {
     use arrow::record_batch::RecordBatch;
     use arrow::array::{StringArray, Int32Array, BooleanArray};
     use arrow::datatypes::{Schema, Field, DataType};
+    use datafusion::scalar::ScalarValue;
 
     #[tokio::test]
     async fn transform_exists_subquery() -> datafusion::error::Result<()> {
@@ -855,6 +936,36 @@ mod tests {
         }
         let after = ctx.state_ref().read().scalar_functions().len();
         assert_eq!(before, after);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn subquery_udf_exec() -> datafusion::error::Result<()> {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2]))],
+        )?;
+        let batch2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![2]))],
+        )?;
+        let table1 = MemTable::try_new(schema.clone(), vec![vec![batch1]])?;
+        let table2 = MemTable::try_new(schema.clone(), vec![vec![batch2]])?;
+        let mut ctx = SessionContext::new();
+        ctx.register_table("t1", Arc::new(table1))?;
+        ctx.register_table("t2", Arc::new(table2))?;
+
+        let sql = "SELECT id FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.id = t1.id)";
+        let (rewritten, names) = rewrite_query(sql, &mut ctx).await?;
+        let df = ctx.sql(&rewritten).await?;
+        let batches = df.collect().await?;
+        assert_eq!(batches[0].num_rows(), 1);
+        let val = ScalarValue::try_from_array(batches[0].column(0), 0)?;
+        assert_eq!(val, ScalarValue::Int32(Some(2)));
+        for n in &names {
+            ctx.deregister_udf(n);
+        }
         Ok(())
     }
 }
