@@ -31,6 +31,34 @@ async fn main() -> datafusion::error::Result<()> {
 }
 ```
 
+## Query Rewrite Example
+
+Given a query with a correlated subquery:
+
+```sql
+SELECT id FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.x = t1.x)
+```
+
+Running `rewrite_query` rewrites it to use a generated UDF:
+
+```sql
+SELECT id FROM t1 WHERE __subq0(t1.x)
+```
+
+During rewriting the library registers a UDF named `__subq0` whose body is the
+original subquery and whose arguments correspond to the referenced outer
+columns. The rewritten SQL can be executed normally once the function is
+registered in the `SessionContext`.
+
+## Implementation Details
+
+The transformation walks the parsed SQL AST looking for `EXISTS`, `IN` and
+standalone subqueries. When such a subquery references columns from the outer
+query, those columns become arguments to a newly created `ScalarUDF`. The UDF is
+registered on the provided `SessionContext` and the subquery expression is
+replaced by a call to this function. The return type of the function is inferred
+by planning the subquery with DataFusion.
+
 The repository contains functional tests showing a complete in-memory example.
 
 ## Development Notes
