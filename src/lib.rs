@@ -964,7 +964,7 @@ mod tests {
     }
 
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn run_big_query_2() -> datafusion::error::Result<()> {
         let mut ctx = SessionContext::new();
         register_example_data(&mut ctx).await?;
