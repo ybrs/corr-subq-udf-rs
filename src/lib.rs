@@ -193,7 +193,7 @@ fn replace_with_fn_call(expr: &mut Expr, fn_name: String, cols: &[(Expr, DataTyp
 }
 
 fn find_correlated_columns(q: &Query) -> Vec<(Expr, DataType)> {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::{BTreeMap, HashSet};
 
     fn collect_table_factor(f: &TableFactor, out: &mut HashSet<String>) {
         match f {
@@ -231,7 +231,7 @@ fn find_correlated_columns(q: &Query) -> Vec<(Expr, DataType)> {
         }
     }
 
-    fn collect_expr(expr: &Expr, aliases: &HashSet<String>, cols: &mut HashMap<String, Expr>) {
+    fn collect_expr(expr: &Expr, aliases: &HashSet<String>, cols: &mut BTreeMap<String, Expr>) {
         match expr {
             Expr::Identifier(_) => {
                 // Unqualified identifiers may refer to local columns;
@@ -296,14 +296,24 @@ fn find_correlated_columns(q: &Query) -> Vec<(Expr, DataType)> {
                     collect_expr(e, aliases, cols);
                 }
             }
-            Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } => {
-                // Do not recurse into nested subqueries
+            Expr::Subquery(q) => {
+                let mut nested = HashSet::new();
+                collect_query(q, &mut nested, cols);
+            }
+            Expr::Exists { subquery, .. } => {
+                let mut nested = HashSet::new();
+                collect_query(subquery, &mut nested, cols);
+            }
+            Expr::InSubquery { subquery, expr: inner, .. } => {
+                collect_expr(inner, aliases, cols);
+                let mut nested = HashSet::new();
+                collect_query(subquery, &mut nested, cols);
             }
             _ => {}
         }
     }
 
-    fn collect_from_select(sel: &Select, aliases: &HashSet<String>, cols: &mut HashMap<String, Expr>) {
+    fn collect_from_select(sel: &Select, aliases: &HashSet<String>, cols: &mut BTreeMap<String, Expr>) {
         if let Some(selection) = &sel.selection {
             collect_expr(selection, aliases, cols);
         }
@@ -324,7 +334,7 @@ fn find_correlated_columns(q: &Query) -> Vec<(Expr, DataType)> {
         }
     }
 
-    fn collect_query(q: &Query, aliases: &mut HashSet<String>, cols: &mut HashMap<String, Expr>) {
+    fn collect_query(q: &Query, aliases: &mut HashSet<String>, cols: &mut BTreeMap<String, Expr>) {
         if let SetExpr::Select(sel) = q.body.as_ref() {
             for twj in &sel.from {
                 collect_table_with_joins(twj, aliases);
@@ -335,7 +345,7 @@ fn find_correlated_columns(q: &Query) -> Vec<(Expr, DataType)> {
     }
 
     let mut aliases = HashSet::new();
-    let mut cols_map: HashMap<String, Expr> = HashMap::new();
+    let mut cols_map: BTreeMap<String, Expr> = BTreeMap::new();
     collect_query(q, &mut aliases, &mut cols_map);
 
     cols_map.into_iter().map(|(_, e)| (e, DataType::Null)).collect()
@@ -616,9 +626,9 @@ mod tests {
                 WHEN EXISTS (
                     SELECT *
                     FROM   information_schema.key_column_usage
-                    WHERE  table_schema = nspname
-                    AND    table_name   = relname
-                    AND    column_name  = attname
+                    WHERE  table_schema = ns.nspname
+                    AND    table_name   = cls.relname
+                    AND    column_name  = attr.attname
                 )
                 THEN TRUE ELSE FALSE
             END                                       AS isprimarykey,
@@ -626,15 +636,15 @@ mod tests {
                 WHEN EXISTS (
                     SELECT *
                     FROM   information_schema.table_constraints
-                    WHERE  table_schema   = nspname
-                    AND    table_name     = relname
+                    WHERE  table_schema   = ns.nspname
+                    AND    table_name     = cls.relname
                     AND    constraint_type = 'UNIQUE'
                     AND    constraint_name IN (
                           SELECT constraint_name
                           FROM   information_schema.constraint_column_usage
-                          WHERE  table_schema = nspname
-                          AND    table_name   = relname
-                          AND    column_name  = attname
+                          WHERE  table_schema = ns.nspname
+                          AND    table_name   = cls.relname
+                          AND    column_name  = attr.attname
                     )
                 )
                 THEN TRUE ELSE FALSE
@@ -922,25 +932,6 @@ mod tests {
         let mut rewritten = stmt.to_string();
         rewritten = rewritten.replace("::oid", "");
 
-        // override generated UDFs with simple implementations accepting any arguments
-        let udf_default = ScalarUDF::from(SimpleScalarUDF::new_with_signature(
-            &names[0],
-            Signature::variadic_any(Volatility::Immutable),
-            DataType::Utf8,
-            Arc::new(|_| Ok(ColumnarValue::Scalar(datafusion::scalar::ScalarValue::Utf8(None))))));
-        ctx.register_udf(udf_default);
-        let udf_primary = ScalarUDF::from(SimpleScalarUDF::new_with_signature(
-            &names[1],
-            Signature::nullary(Volatility::Immutable),
-            DataType::Boolean,
-            Arc::new(|_| Ok(ColumnarValue::Scalar(datafusion::scalar::ScalarValue::Boolean(Some(true)))))));
-        ctx.register_udf(udf_primary);
-        let udf_unique = ScalarUDF::from(SimpleScalarUDF::new_with_signature(
-            &names[2],
-            Signature::nullary(Volatility::Immutable),
-            DataType::Boolean,
-            Arc::new(|_| Ok(ColumnarValue::Scalar(datafusion::scalar::ScalarValue::Boolean(Some(true)))))));
-        ctx.register_udf(udf_unique);
 
         let df = ctx.sql(&rewritten).await?;
         let batches = df.collect().await?;
@@ -1052,25 +1043,6 @@ mod tests {
         let mut rewritten = stmt.to_string();
         rewritten = rewritten.replace("::oid", "");
         println!("rewritten query {:?}", rewritten);
-        // override generated UDFs with simple implementations accepting any arguments
-        let udf_default = ScalarUDF::from(SimpleScalarUDF::new_with_signature(
-            &names[0],
-            Signature::variadic_any(Volatility::Immutable),
-            DataType::Utf8,
-            Arc::new(|_| Ok(ColumnarValue::Scalar(datafusion::scalar::ScalarValue::Utf8(None))))));
-        ctx.register_udf(udf_default);
-        let udf_primary = ScalarUDF::from(SimpleScalarUDF::new_with_signature(
-            &names[1],
-            Signature::nullary(Volatility::Immutable),
-            DataType::Boolean,
-            Arc::new(|_| Ok(ColumnarValue::Scalar(datafusion::scalar::ScalarValue::Boolean(Some(true)))))));
-        ctx.register_udf(udf_primary);
-        let udf_unique = ScalarUDF::from(SimpleScalarUDF::new_with_signature(
-            &names[2],
-            Signature::nullary(Volatility::Immutable),
-            DataType::Boolean,
-            Arc::new(|_| Ok(ColumnarValue::Scalar(datafusion::scalar::ScalarValue::Boolean(Some(true)))))));
-        ctx.register_udf(udf_unique);
 
         let df = ctx.sql(&rewritten).await?;
         let batches = df.collect().await?;
@@ -1143,7 +1115,9 @@ mod tests {
             if let SetExpr::Select(sel) = q.body.as_ref() {
                 if let Some(Expr::Exists { subquery, .. }) = &sel.selection {
                     let cols = find_correlated_columns(subquery);
-                    assert!(cols.is_empty());
+                    let mut vals: Vec<_> = cols.iter().map(|(e, _)| e.to_string()).collect();
+                    vals.sort();
+                    assert_eq!(vals, vec!["t1.v", "t2.id"]);
                 }
             }
         }
