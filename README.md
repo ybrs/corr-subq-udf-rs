@@ -68,3 +68,12 @@ The test suite now checks handling of fully qualified column names. The
 references to outer queries. It now examines the table component of compound
 identifiers so expressions like `schema.table.col` are not incorrectly treated
 as correlated when `table` is a local source.
+
+### Handling Unqualified Columns
+
+Subqueries may reference outer columns without prefixing them with an alias.
+The library now accepts a simple catalogue of table definitions and uses it to
+resolve such references. During the AST walk, every identifier inside a
+correlated subquery is looked up in the outer query's alias map. When a matching
+column is found it gets rewritten to a fully qualified `alias.column` form so it
+can be passed as a UDF parameter.
