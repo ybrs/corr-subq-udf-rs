@@ -972,6 +972,136 @@ mod tests {
         Ok(())
     }
 
+
+    #[tokio::test]
+    async fn run_big_query_2() -> datafusion::error::Result<()> {
+        let mut ctx = SessionContext::new();
+        register_example_data(&mut ctx).await?;
+        let sql = r#"
+        SELECT
+            attname                                   AS name,
+            attnum                                    AS OID,
+            typ.oid                                   AS typoid,
+            typ.typname                               AS datatype,
+            attnotnull                                AS not_null,
+            attr.atthasdef                            AS has_default_val,
+            nspname,
+            relname,
+            attrelid,
+            CASE
+                WHEN typ.typtype = 'd'
+                     THEN typ.typtypmod
+                ELSE atttypmod
+            END                                       AS typmod,
+            CASE
+                WHEN atthasdef
+                     THEN (
+                         SELECT pg_get_expr(adbin, cls.oid)
+                         FROM   pg_attrdef
+                         WHERE  adrelid = cls.oid
+                         AND    adnum   = attr.attnum
+                     )
+                ELSE NULL
+            END                                       AS default,
+            TRUE                                       AS is_updatable,
+            CASE
+                WHEN EXISTS (
+                    SELECT *
+                    FROM   information_schema.key_column_usage
+                    WHERE  table_schema = ns.nspname
+                    AND    table_name   = cls.relname
+                    AND    column_name  = attr.attname
+                )
+                THEN TRUE ELSE FALSE
+            END                                       AS isprimarykey,
+            CASE
+                WHEN EXISTS (
+                    SELECT *
+                    FROM   information_schema.table_constraints
+                    WHERE  table_schema   = ns.nspname
+                    AND    table_name     = cls.relname
+                    AND    constraint_type = 'UNIQUE'
+                    AND    constraint_name IN (
+                          SELECT constraint_name
+                          FROM   information_schema.constraint_column_usage
+                          WHERE  table_schema = ns.nspname
+                          AND    table_name   = cls.relname
+                          AND    column_name  = attr.attname
+                    )
+                )
+                THEN TRUE ELSE FALSE
+            END                                       AS isunique
+        FROM pg_attribute         AS attr
+        JOIN pg_type              AS typ ON attr.atttypid  = typ.oid
+        JOIN pg_class             AS cls ON cls.oid        = attr.attrelid
+        JOIN pg_namespace         AS ns  ON ns.oid         = cls.relnamespace
+        LEFT JOIN information_schema.columns AS col
+               ON col.table_schema = nspname
+              AND col.table_name   = relname
+              AND col.column_name  = attname
+        WHERE  attr.attrelid = 50010::oid
+          AND  attr.attnum  > 0
+          AND  atttypid     <> 0
+          AND  relkind      IN ('r','v','m','p')
+          AND  NOT attisdropped
+        ORDER BY attnum;
+        "#;
+        let mut stmt = Parser::parse_sql(&GenericDialect{}, sql)?.remove(0);
+        let mut names = Vec::new();
+        transform_statement(&mut stmt, &mut ctx, &mut names).await?;
+        let mut rewritten = stmt.to_string();
+        rewritten = rewritten.replace("::oid", "");
+        println!("rewritten query {:?}", rewritten);
+        // override generated UDFs with simple implementations accepting any arguments
+        let udf_default = ScalarUDF::from(SimpleScalarUDF::new_with_signature(
+            &names[0],
+            Signature::variadic_any(Volatility::Immutable),
+            DataType::Utf8,
+            Arc::new(|_| Ok(ColumnarValue::Scalar(datafusion::scalar::ScalarValue::Utf8(None))))));
+        ctx.register_udf(udf_default);
+        let udf_primary = ScalarUDF::from(SimpleScalarUDF::new_with_signature(
+            &names[1],
+            Signature::nullary(Volatility::Immutable),
+            DataType::Boolean,
+            Arc::new(|_| Ok(ColumnarValue::Scalar(datafusion::scalar::ScalarValue::Boolean(Some(true)))))));
+        ctx.register_udf(udf_primary);
+        let udf_unique = ScalarUDF::from(SimpleScalarUDF::new_with_signature(
+            &names[2],
+            Signature::nullary(Volatility::Immutable),
+            DataType::Boolean,
+            Arc::new(|_| Ok(ColumnarValue::Scalar(datafusion::scalar::ScalarValue::Boolean(Some(true)))))));
+        ctx.register_udf(udf_unique);
+
+        let df = ctx.sql(&rewritten).await?;
+        let batches = df.collect().await?;
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 1);
+        let batch = &batches[0];
+        let name = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0);
+        assert_eq!(name, "id");
+        let isprimary = batch
+            .column(12)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap()
+            .value(0);
+        assert!(isprimary);
+        let isunique = batch
+            .column(13)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap()
+            .value(0);
+        assert!(isunique);
+
+        Ok(())
+    }
+
     #[test]
     fn find_correlated_qualified() {
         let sql = "SELECT * FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.id = t1.id)";
