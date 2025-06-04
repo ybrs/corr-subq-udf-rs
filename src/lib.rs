@@ -139,6 +139,7 @@ fn transform_expr<'a>(
     Box::pin(async move {
         match expr {
             Expr::Subquery(q) => {
+                qualify_unqualified_columns(q, aliases);
                 let cols = find_correlated_columns_with_aliases(q, aliases);
                 let id = NEXT_UDF_ID.fetch_add(1, Ordering::SeqCst);
                 let fn_name = format!("__subq{}", id);
@@ -147,6 +148,7 @@ fn transform_expr<'a>(
                 replace_with_fn_call(expr, fn_name, &cols);
             }
             Expr::Exists { subquery, .. } => {
+                qualify_unqualified_columns(subquery, aliases);
                 let cols = find_correlated_columns_with_aliases(subquery, aliases);
                 let id = NEXT_UDF_ID.fetch_add(1, Ordering::SeqCst);
                 let fn_name = format!("__subq{}", id);
@@ -204,6 +206,7 @@ fn transform_expr<'a>(
                 ..
             } => {
                 transform_expr(inner, ctx, names, aliases).await?;
+                qualify_unqualified_columns(subquery, aliases);
                 let cols = find_correlated_columns_with_aliases(subquery, aliases);
                 let id = NEXT_UDF_ID.fetch_add(1, Ordering::SeqCst);
                 let fn_name = format!("__subq{}", id);
@@ -271,6 +274,193 @@ fn find_column(name: &str, aliases: &AliasMap) -> Option<Expr> {
         }
     }
     None
+}
+
+fn qualify_unqualified_columns(q: &mut Query, outer: &AliasMap) {
+    use std::collections::{HashMap, HashSet};
+
+    fn collect_table_factor(f: &TableFactor, out: &mut HashMap<String, String>) {
+        match f {
+            TableFactor::Table { name, alias, .. } => {
+                if let Some(last) = name.0.last().and_then(|p| p.as_ident()) {
+                    let table = last.value.clone();
+                    if let Some(a) = alias {
+                        out.insert(a.name.value.clone(), table);
+                    } else {
+                        out.insert(table.clone(), table);
+                    }
+                }
+            }
+            TableFactor::Derived { alias, .. } => {
+                if let Some(a) = alias {
+                    out.insert(a.name.value.clone(), String::new());
+                }
+            }
+            TableFactor::NestedJoin { table_with_joins, .. } => {
+                collect_table_with_joins(table_with_joins, out);
+            }
+            TableFactor::TableFunction { alias, .. } => {
+                if let Some(a) = alias {
+                    out.insert(a.name.value.clone(), String::new());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn collect_table_with_joins(twj: &TableWithJoins, out: &mut HashMap<String, String>) {
+        collect_table_factor(&twj.relation, out);
+        for j in &twj.joins {
+            collect_table_factor(&j.relation, out);
+        }
+    }
+
+    fn gather_columns(map: &HashMap<String, String>) -> HashSet<String> {
+        let mut out = HashSet::new();
+        for table in map.values() {
+            if let Some(cols) = table_columns(table) {
+                for c in cols {
+                    out.insert(c.to_string());
+                }
+            }
+        }
+        out
+    }
+
+    fn qualify_expr(
+        expr: &mut Expr,
+        local_aliases: &HashMap<String, String>,
+        local_cols: &HashSet<String>,
+        outer_aliases: &AliasMap,
+    ) {
+        match expr {
+            Expr::Identifier(ident) => {
+                if !local_cols.contains(&ident.value) {
+                    if let Some(Expr::CompoundIdentifier(idents)) = find_column(&ident.value, outer_aliases) {
+                        *expr = Expr::CompoundIdentifier(idents);
+                    }
+                }
+            }
+            Expr::BinaryOp { left, right, .. } => {
+                qualify_expr(left, local_aliases, local_cols, outer_aliases);
+                qualify_expr(right, local_aliases, local_cols, outer_aliases);
+            }
+            Expr::UnaryOp { expr: inner, .. } => {
+                qualify_expr(inner, local_aliases, local_cols, outer_aliases);
+            }
+            Expr::Nested(inner) => {
+                qualify_expr(inner, local_aliases, local_cols, outer_aliases);
+            }
+            Expr::Function(f) => match &mut f.args {
+                FunctionArguments::List(list) => {
+                    for arg in &mut list.args {
+                        if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) = arg {
+                            qualify_expr(e, local_aliases, local_cols, outer_aliases);
+                        }
+                    }
+                }
+                FunctionArguments::Subquery(q) => {
+                    let mut nested_outer = outer_aliases.clone();
+                    for (k, v) in local_aliases {
+                        nested_outer.insert(k.clone(), v.clone());
+                    }
+                    qualify_query(q, &nested_outer);
+                }
+                FunctionArguments::None => {}
+            },
+            Expr::InList { expr: inner, list, .. } => {
+                qualify_expr(inner, local_aliases, local_cols, outer_aliases);
+                for e in list {
+                    qualify_expr(e, local_aliases, local_cols, outer_aliases);
+                }
+            }
+            Expr::Between { expr: inner, low, high, .. } => {
+                qualify_expr(inner, local_aliases, local_cols, outer_aliases);
+                qualify_expr(low, local_aliases, local_cols, outer_aliases);
+                qualify_expr(high, local_aliases, local_cols, outer_aliases);
+            }
+            Expr::Case { operand, conditions, else_result, .. } => {
+                if let Some(op) = operand {
+                    qualify_expr(op, local_aliases, local_cols, outer_aliases);
+                }
+                for when in conditions {
+                    qualify_expr(&mut when.condition, local_aliases, local_cols, outer_aliases);
+                    qualify_expr(&mut when.result, local_aliases, local_cols, outer_aliases);
+                }
+                if let Some(er) = else_result {
+                    qualify_expr(er, local_aliases, local_cols, outer_aliases);
+                }
+            }
+            Expr::Cast { expr: inner, .. } => qualify_expr(inner, local_aliases, local_cols, outer_aliases),
+            Expr::Collate { expr: inner, .. } => qualify_expr(inner, local_aliases, local_cols, outer_aliases),
+            Expr::Substring { expr: inner, substring_from, substring_for, .. } => {
+                qualify_expr(inner, local_aliases, local_cols, outer_aliases);
+                if let Some(e) = substring_from {
+                    qualify_expr(e, local_aliases, local_cols, outer_aliases);
+                }
+                if let Some(e) = substring_for {
+                    qualify_expr(e, local_aliases, local_cols, outer_aliases);
+                }
+            }
+            Expr::Subquery(q) => {
+                let mut nested_outer = outer_aliases.clone();
+                for (k, v) in local_aliases {
+                    nested_outer.insert(k.clone(), v.clone());
+                }
+                qualify_query(q, &nested_outer);
+            }
+            Expr::Exists { subquery, .. } => {
+                let mut nested_outer = outer_aliases.clone();
+                for (k, v) in local_aliases {
+                    nested_outer.insert(k.clone(), v.clone());
+                }
+                qualify_query(subquery, &nested_outer);
+            }
+            Expr::InSubquery { subquery, expr: inner, .. } => {
+                qualify_expr(inner, local_aliases, local_cols, outer_aliases);
+                let mut nested_outer = outer_aliases.clone();
+                for (k, v) in local_aliases {
+                    nested_outer.insert(k.clone(), v.clone());
+                }
+                qualify_query(subquery, &nested_outer);
+            }
+            _ => {}
+        }
+    }
+
+    fn qualify_from_select(sel: &mut Select, outer_aliases: &AliasMap) {
+        let mut local_aliases = HashMap::new();
+        for twj in &sel.from {
+            collect_table_with_joins(twj, &mut local_aliases);
+        }
+        let local_cols = gather_columns(&local_aliases);
+        if let Some(selection) = &mut sel.selection {
+            qualify_expr(selection, &local_aliases, &local_cols, outer_aliases);
+        }
+        for item in &mut sel.projection {
+            match item {
+                SelectItem::UnnamedExpr(e) => qualify_expr(e, &local_aliases, &local_cols, outer_aliases),
+                SelectItem::ExprWithAlias { expr, .. } => qualify_expr(expr, &local_aliases, &local_cols, outer_aliases),
+                _ => {}
+            }
+        }
+        if let GroupByExpr::Expressions(exprs, _) = &mut sel.group_by {
+            for g in exprs {
+                qualify_expr(g, &local_aliases, &local_cols, outer_aliases);
+            }
+        }
+        if let Some(h) = &mut sel.having {
+            qualify_expr(h, &local_aliases, &local_cols, outer_aliases);
+        }
+    }
+
+    fn qualify_query(q: &mut Query, outer_aliases: &AliasMap) {
+        if let SetExpr::Select(sel) = q.body.as_mut() {
+            qualify_from_select(sel, outer_aliases);
+        }
+    }
+
+    qualify_query(q, outer);
 }
 
 fn find_correlated_columns_with_aliases(q: &Query, outer: &AliasMap) -> Vec<(Expr, DataType)> {
@@ -978,10 +1168,10 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test(flavor = "multi_thread")]  
+    #[tokio::test(flavor = "multi_thread")]
     async fn run_big_query() -> datafusion::error::Result<()> {
-        /// this test fails, because it can't properly find columns 
-        /// eg: nspname is unqualified, so it doesn't put the nspname to the list of arguments. 
+        // ensures unqualified columns inside EXISTS clauses are qualified
+        // and the rewritten query executes correctly.
         let mut ctx = SessionContext::new();
         register_example_data(&mut ctx).await?;
         let sql = r#"
@@ -1198,6 +1388,35 @@ mod tests {
             .value(0);
         assert!(isunique);
 
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rewrite_unqualified_columns() -> datafusion::error::Result<()> {
+        let mut ctx = SessionContext::new();
+        register_example_data(&mut ctx).await?;
+        let sql = r#"
+        SELECT attname
+        FROM pg_attribute AS attr
+        JOIN pg_class AS cls ON cls.oid = attr.attrelid
+        JOIN pg_namespace AS ns ON ns.oid = cls.relnamespace
+        WHERE EXISTS (
+            SELECT 1
+            FROM information_schema.key_column_usage
+            WHERE table_schema = nspname
+              AND table_name   = relname
+              AND column_name  = attname
+        )
+        "#;
+        let (rewritten, names) = rewrite_query(sql, &mut ctx).await?;
+        assert!(rewritten.contains("ns.nspname"));
+        assert!(rewritten.contains("cls.relname"));
+        assert!(rewritten.contains("attr.attname"));
+        let df = ctx.sql(&rewritten).await?;
+        let batches = df.collect().await?;
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 1);
+        for n in names { ctx.deregister_udf(&n); }
         Ok(())
     }
 
