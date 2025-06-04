@@ -978,7 +978,7 @@ mod tests {
         Ok(())
     }
 
-    // #[tokio::test(flavor = "multi_thread")]  
+    #[tokio::test(flavor = "multi_thread")]  
     async fn run_big_query() -> datafusion::error::Result<()> {
         /// this test fails, because it can't properly find columns 
         /// eg: nspname is unqualified, so it doesn't put the nspname to the list of arguments. 
