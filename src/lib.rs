@@ -527,29 +527,33 @@ async fn register_udf(
     let ret_clone = ret_type.clone();
 
     let fun = move |args: &[ColumnarValue]| {
-        futures::executor::block_on(async {
-            let arrays = ColumnarValue::values_to_arrays(args)?;
-            let len = arrays.first().map(|a| a.len()).unwrap_or(1);
-            let mut out_vals = Vec::with_capacity(len);
-            for row in 0..len {
-                let mut params = Vec::new();
-                for arr in &arrays {
-                    params.push(ScalarValue::try_from_array(arr, row)?);
+        tokio::task::block_in_place(|| {
+            futures::executor::block_on(async {
+                let arrays = ColumnarValue::values_to_arrays(args)?;
+                let len = arrays.first().map(|a| a.len()).unwrap_or(1);
+                let mut out_vals = Vec::with_capacity(len);
+                for row in 0..len {
+                    let mut params = Vec::new();
+                    for arr in &arrays {
+                        params.push(ScalarValue::try_from_array(arr, row)?);
+                    }
+                    let df = ctx_clone.sql(&sql_clone).await?;
+                    let df = df.with_param_values(params)?;
+                    let batches = df.collect().await?;
+                    let value = if is_exists {
+                        ScalarValue::Boolean(
+                            Some(!batches.is_empty() && batches[0].num_rows() > 0),
+                        )
+                    } else if batches.is_empty() || batches[0].num_rows() == 0 {
+                        ScalarValue::try_from(&ret_clone)?
+                    } else {
+                        ScalarValue::try_from_array(batches[0].column(0).as_ref(), 0)?
+                    };
+                    out_vals.push(value);
                 }
-                let df = ctx_clone.sql(&sql_clone).await?;
-                let df = df.with_param_values(params)?;
-                let batches = df.collect().await?;
-                let value = if is_exists {
-                    ScalarValue::Boolean(Some(!batches.is_empty() && batches[0].num_rows() > 0))
-                } else if batches.is_empty() || batches[0].num_rows() == 0 {
-                    ScalarValue::try_from(&ret_clone)?
-                } else {
-                    ScalarValue::try_from_array(batches[0].column(0).as_ref(), 0)?
-                };
-                out_vals.push(value);
-            }
-            let array = ScalarValue::iter_to_array(out_vals.into_iter())?;
-            Ok(ColumnarValue::Array(array))
+                let array = ScalarValue::iter_to_array(out_vals.into_iter())?;
+                Ok(ColumnarValue::Array(array))
+            })
         })
     };
 
@@ -593,7 +597,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]  
     async fn rewrite_big_query() -> datafusion::error::Result<()> {
         let sql = r#"
         SELECT
@@ -853,7 +857,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]  
     async fn run_big_query() -> datafusion::error::Result<()> {
         let mut ctx = SessionContext::new();
         register_example_data(&mut ctx).await?;
@@ -964,7 +968,7 @@ mod tests {
     }
 
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
     async fn run_big_query_2() -> datafusion::error::Result<()> {
         let mut ctx = SessionContext::new();
         register_example_data(&mut ctx).await?;
