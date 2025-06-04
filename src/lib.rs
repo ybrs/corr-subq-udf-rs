@@ -182,11 +182,11 @@ fn transform_expr<'a>(
     })
 }
 
-fn replace_with_fn_call(expr: &mut Expr, fn_name: String, cols: &[(Expr, DataType)]) {
+fn replace_with_fn_call(expr: &mut Expr, fn_name: String, cols: &[CorrColumn]) {
     let args: Vec<FunctionArg> = cols
         .iter()
-        .map(|(e, _)| {
-            FunctionArg::Unnamed(FunctionArgExpr::Expr(e.clone()))
+        .map(|c| {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(c.expr.clone()))
         })
         .collect();
     *expr = Expr::Function(Function {
@@ -207,6 +207,15 @@ fn replace_with_fn_call(expr: &mut Expr, fn_name: String, cols: &[(Expr, DataTyp
 
 type TableDefs<'a> = std::collections::HashMap<&'a str, &'a [&'a str]>;
 type AliasMap = std::collections::HashMap<String, String>;
+
+#[derive(Clone)]
+struct CorrColumn {
+    /// Expression used as argument to the generated UDF (fully qualified)
+    expr: Expr,
+    /// Original expression string inside the subquery used for placeholder replacement
+    original: String,
+    data_type: DataType,
+}
 
 fn find_column<'a>(
     col: &str,
@@ -231,7 +240,7 @@ fn find_correlated_columns(
     q: &Query,
     outer_aliases: &AliasMap,
     table_defs: &TableDefs<'_>,
-) -> Vec<(Expr, DataType)> {
+) -> Vec<CorrColumn> {
     use std::collections::BTreeMap;
 
     fn collect_table_factor(f: &TableFactor, out: &mut AliasMap) {
@@ -274,20 +283,27 @@ fn find_correlated_columns(
         local_aliases: &AliasMap,
         outer_aliases: &AliasMap,
         table_defs: &TableDefs<'_>,
-        cols: &mut BTreeMap<String, Expr>,
+        cols: &mut BTreeMap<String, CorrColumn>,
     ) {
         match expr {
             Expr::Identifier(ident) => {
                 if let Some(q) = find_column(&ident.value, outer_aliases, table_defs) {
-                    cols.entry(q.to_string()).or_insert(q);
+                    cols.entry(q.to_string()).or_insert(CorrColumn {
+                        expr: q,
+                        original: expr.to_string(),
+                        data_type: DataType::Null,
+                    });
                 }
             }
             Expr::CompoundIdentifier(idents) => {
                 let alias_idx = if idents.len() >= 2 { idents.len() - 2 } else { 0 };
                 if let Some(ident) = idents.get(alias_idx) {
                     if !local_aliases.contains_key(&ident.value) {
-                        cols.entry(expr.to_string())
-                            .or_insert_with(|| Expr::CompoundIdentifier(idents.clone()));
+                        cols.entry(expr.to_string()).or_insert(CorrColumn {
+                            expr: Expr::CompoundIdentifier(idents.clone()),
+                            original: expr.to_string(),
+                            data_type: DataType::Null,
+                        });
                     }
                 }
             }
@@ -366,7 +382,7 @@ fn find_correlated_columns(
         local_aliases: &AliasMap,
         outer_aliases: &AliasMap,
         table_defs: &TableDefs<'_>,
-        cols: &mut BTreeMap<String, Expr>,
+        cols: &mut BTreeMap<String, CorrColumn>,
     ) {
         if let Some(selection) = &sel.selection {
             collect_expr(selection, local_aliases, outer_aliases, table_defs, cols);
@@ -398,7 +414,7 @@ fn find_correlated_columns(
         q: &Query,
         local_aliases: &mut AliasMap,
         outer_aliases: &AliasMap,
-        cols: &mut BTreeMap<String, Expr>,
+        cols: &mut BTreeMap<String, CorrColumn>,
         table_defs: &TableDefs<'_>,
     ) {
         if let SetExpr::Select(sel) = q.body.as_ref() {
@@ -410,17 +426,17 @@ fn find_correlated_columns(
     }
 
     let mut aliases = AliasMap::new();
-    let mut cols_map: BTreeMap<String, Expr> = BTreeMap::new();
+    let mut cols_map: BTreeMap<String, CorrColumn> = BTreeMap::new();
     collect_query(q, &mut aliases, outer_aliases, &mut cols_map, table_defs);
 
-    cols_map.into_iter().map(|(_, e)| (e, DataType::Null)).collect()
+    cols_map.into_iter().map(|(_, c)| c).collect()
 }
 
 async fn register_udf(
     ctx: &mut SessionContext,
     name: &str,
     sub_sql: String,
-    cols: &[(Expr, DataType)],
+    cols: &[CorrColumn],
     is_exists: bool,
 ) -> datafusion::error::Result<()> {
     let arg_count = cols.len();
@@ -551,7 +567,7 @@ async fn register_udf(
         let replacements: Vec<(String, String)> = cols
             .iter()
             .enumerate()
-            .map(|(i, (e, _))| (e.to_string(), format!("${}", i + 1)))
+            .map(|(i, c)| (c.original.clone(), format!("${}", i + 1)))
             .collect();
 
         if let SetExpr::Select(sel) = q.body.as_mut() {
@@ -1170,7 +1186,7 @@ mod tests {
                     let defs = test_table_defs();
                     let aliases = AliasMap::new();
                     let cols = find_correlated_columns(subquery, &aliases, &defs);
-                    let vals: Vec<_> = cols.iter().map(|(e, _)| e.to_string()).collect();
+                    let vals: Vec<_> = cols.iter().map(|c| c.expr.to_string()).collect();
                     assert_eq!(vals, vec!["t1.id"]);
                 }
             }
@@ -1188,7 +1204,7 @@ mod tests {
                     let aliases = AliasMap::new();
                     let mut vals: Vec<_> = find_correlated_columns(subquery, &aliases, &defs)
                         .into_iter()
-                        .map(|(e, _)| e.to_string())
+                        .map(|c| c.expr.to_string())
                         .collect();
                     vals.sort();
                     assert_eq!(vals, vec!["t1.id", "t1.x"]);
@@ -1207,7 +1223,7 @@ mod tests {
                     let defs = test_table_defs();
                     let aliases = AliasMap::new();
                     let cols = find_correlated_columns(subquery, &aliases, &defs);
-                    let mut vals: Vec<_> = cols.iter().map(|(e, _)| e.to_string()).collect();
+                    let mut vals: Vec<_> = cols.iter().map(|c| c.expr.to_string()).collect();
                     vals.sort();
                     assert_eq!(vals, vec!["t1.v", "t2.id"]);
                 }
@@ -1224,6 +1240,26 @@ mod tests {
             let aliases = AliasMap::new();
             let cols = find_correlated_columns(&q, &aliases, &defs);
             assert!(cols.is_empty());
+        }
+    }
+
+    #[test]
+    fn find_correlated_unqualified() {
+        let sql = "SELECT attname FROM pg_attribute AS attr \n            JOIN pg_class AS cls ON cls.oid = attr.attrelid \n            JOIN pg_namespace AS ns ON ns.oid = cls.relnamespace \n            WHERE EXISTS(SELECT 1 FROM information_schema.key_column_usage WHERE table_schema = nspname AND table_name = relname AND column_name = attname)";
+        let stmt = Parser::parse_sql(&GenericDialect {}, sql).unwrap().remove(0);
+        if let Statement::Query(q) = stmt {
+            if let SetExpr::Select(sel) = q.body.as_ref() {
+                if let Some(Expr::Exists { subquery, .. }) = &sel.selection {
+                    let defs = test_table_defs();
+                    let aliases = AliasMap::new();
+                    let mut vals: Vec<_> = find_correlated_columns(subquery, &aliases, &defs)
+                        .into_iter()
+                        .map(|c| c.expr.to_string())
+                        .collect();
+                    vals.sort();
+                    assert_eq!(vals, vec!["attr.attname", "cls.relname", "ns.nspname"]);
+                }
+            }
         }
     }
 
