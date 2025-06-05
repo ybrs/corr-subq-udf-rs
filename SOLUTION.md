@@ -1,0 +1,2 @@
+Implemented alias-aware correlated column detection. Added alias collection for SELECT queries and a column lookup map to resolve unqualified identifiers inside EXISTS subqueries. New helper `find_correlated_columns_with_aliases` qualifies unqualified columns using table metadata, enabling rewrite of queries containing references like `nspname`.
+Also updated an async test to run on a multi-thread Tokio runtime so tests pass.
