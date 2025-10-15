@@ -8,8 +8,8 @@ license = "MIT"
 path = "src/lib.rs"
 
 [dependencies]
-datafusion = { version = "47.0.0", default-features = false, features = ["avro", "parquet"] }
-arrow      = "55.1.0"
-sqlparser  = "0.55.0"
+datafusion = { version = "50.2.0", default-features = false, features = ["avro", "parquet"] }
+arrow      = "56.0.0"
+sqlparser  = "0.58.0"
 tokio      = { version = "1.43.1", features = ["rt-multi-thread", "macros"] }
 futures    = "0.3"

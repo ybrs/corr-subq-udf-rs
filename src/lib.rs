@@ -171,6 +171,7 @@ fn transform_expr<'a>(
                 operand,
                 conditions,
                 else_result,
+                ..
             } => {
                 if let Some(op) = operand {
                     transform_expr(op, ctx, names, aliases).await?;
@@ -1423,7 +1424,7 @@ mod tests {
     #[test]
     fn find_correlated_qualified() {
         let sql = "SELECT * FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.id = t1.id)";
-        let mut stmt = Parser::parse_sql(&GenericDialect {}, sql).unwrap().remove(0);
+        let stmt = Parser::parse_sql(&GenericDialect {}, sql).unwrap().remove(0);
         if let Statement::Query(q) = stmt {
             if let SetExpr::Select(sel) = q.body.as_ref() {
                 if let Some(Expr::Exists { subquery, .. }) = &sel.selection {
@@ -1456,7 +1457,7 @@ mod tests {
     #[test]
     fn find_correlated_nested_ignore_inner() {
         let sql = "SELECT * FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE EXISTS (SELECT 1 FROM t3 WHERE t3.id = t2.id AND t3.v = t1.v))";
-        let mut stmt = Parser::parse_sql(&GenericDialect {}, sql).unwrap().remove(0);
+        let stmt = Parser::parse_sql(&GenericDialect {}, sql).unwrap().remove(0);
         if let Statement::Query(q) = stmt {
             if let SetExpr::Select(sel) = q.body.as_ref() {
                 if let Some(Expr::Exists { subquery, .. }) = &sel.selection {
