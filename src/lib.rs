@@ -29,7 +29,9 @@ pub async fn rewrite_query(
     ctx: &mut SessionContext,
 ) -> datafusion::error::Result<(String, Vec<String>)> {
     let dialect = GenericDialect {};
-    let mut stmt = Parser::parse_sql(&dialect, sql)?.remove(0);
+    let mut stmt = Parser::parse_sql(&dialect, sql)
+        .map_err(|e| datafusion::error::DataFusionError::Plan(format!("failed to parse SQL: {e}")))?
+        .remove(0);
     let mut names = Vec::new();
     transform_statement(&mut stmt, ctx, &mut names).await?;
     Ok((stmt.to_string(), names))
@@ -674,7 +676,9 @@ async fn register_udf(
 
     // replace correlated columns with placeholders like $1, $2
     let dialect = GenericDialect {};
-    let mut stmt = Parser::parse_sql(&dialect, &sub_sql)?.remove(0);
+    let mut stmt = Parser::parse_sql(&dialect, &sub_sql)
+        .map_err(|e| datafusion::error::DataFusionError::Plan(format!("failed to parse SQL: {e}")))?
+        .remove(0);
     if let Statement::Query(q) = &mut stmt {
         fn replace_expr(expr: &mut Expr, targets: &[(String, String)]) {
             for (src, placeholder) in targets {
@@ -902,7 +906,9 @@ mod tests {
     async fn transform_exists_subquery() -> datafusion::error::Result<()> {
         let sql = "select 1 where exists(select 1)";
         let dialect = GenericDialect {};
-        let mut stmt = Parser::parse_sql(&dialect, sql)?.remove(0);
+        let mut stmt = Parser::parse_sql(&dialect, sql)
+        .map_err(|e| datafusion::error::DataFusionError::Plan(format!("failed to parse SQL: {e}")))?
+        .remove(0);
         let mut ctx = SessionContext::new();
         let mut names = Vec::new();
         transform_statement(&mut stmt, &mut ctx, &mut names).await?;
@@ -1244,7 +1250,9 @@ mod tests {
           AND  NOT attisdropped
         ORDER BY attnum;
         "#;
-        let mut stmt = Parser::parse_sql(&GenericDialect{}, sql)?.remove(0);
+        let mut stmt = Parser::parse_sql(&GenericDialect{}, sql)
+        .map_err(|e| datafusion::error::DataFusionError::Plan(format!("failed to parse SQL: {e}")))?
+        .remove(0);
         let mut names = Vec::new();
         transform_statement(&mut stmt, &mut ctx, &mut names).await?;
         let mut rewritten = stmt.to_string();
@@ -1355,7 +1363,9 @@ mod tests {
           AND  NOT attisdropped
         ORDER BY attnum;
         "#;
-        let mut stmt = Parser::parse_sql(&GenericDialect{}, sql)?.remove(0);
+        let mut stmt = Parser::parse_sql(&GenericDialect{}, sql)
+        .map_err(|e| datafusion::error::DataFusionError::Plan(format!("failed to parse SQL: {e}")))?
+        .remove(0);
         let mut names = Vec::new();
         transform_statement(&mut stmt, &mut ctx, &mut names).await?;
         let mut rewritten = stmt.to_string();
