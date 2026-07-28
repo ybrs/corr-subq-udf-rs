@@ -6,7 +6,7 @@ use df_subquery_udf::rewrite_and_exec;
 #[tokio::main]
 async fn main() -> datafusion::error::Result<()> {
     let mut ctx = SessionContext::new();
-    let sql = r#"
+    let sql = r"
         SELECT
             attname                                   AS name,
             attnum                                    AS OID,
@@ -74,6 +74,6 @@ async fn main() -> datafusion::error::Result<()> {
           AND  relkind      IN ('r','v','m','p')
           AND  NOT attisdropped
         ORDER BY attnum;
-    "#;
+    ";
     rewrite_and_exec(sql, &mut ctx).await
 }
