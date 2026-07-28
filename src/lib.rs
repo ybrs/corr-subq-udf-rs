@@ -107,29 +107,43 @@ fn collect_aliases(sel: &Select) -> AliasMap {
     out
 }
 
-async fn transform_setexpr(
-    sexpr: &mut SetExpr,
-    ctx: &mut SessionContext,
-    names: &mut Vec<String>,
-) -> datafusion::error::Result<()> {
-    if let SetExpr::Select(s) = sexpr {
-        let aliases = collect_aliases(s);
-        for item in &mut s.projection {
-            match item {
-                SelectItem::UnnamedExpr(e) => {
+fn transform_setexpr<'a>(
+    sexpr: &'a mut SetExpr,
+    ctx: &'a mut SessionContext,
+    names: &'a mut Vec<String>,
+) -> BoxFuture<'a, datafusion::error::Result<()>> {
+    Box::pin(async move {
+        match sexpr {
+            SetExpr::Select(s) => {
+                let aliases = collect_aliases(s);
+                for item in &mut s.projection {
+                    match item {
+                        SelectItem::UnnamedExpr(e) => {
+                            transform_expr(e, ctx, names, &aliases).await?;
+                        }
+                        SelectItem::ExprWithAlias { expr, .. } => {
+                            transform_expr(expr, ctx, names, &aliases).await?;
+                        }
+                        _ => {}
+                    }
+                }
+                if let Some(e) = &mut s.selection {
                     transform_expr(e, ctx, names, &aliases).await?;
                 }
-                SelectItem::ExprWithAlias { expr, .. } => {
-                    transform_expr(expr, ctx, names, &aliases).await?;
-                }
-                _ => {}
             }
+            // Recurse into both arms of `UNION`/`INTERSECT`/`EXCEPT` so a
+            // correlated subquery in any branch is still rewritten.
+            SetExpr::SetOperation { left, right, .. } => {
+                transform_setexpr(left, ctx, names).await?;
+                transform_setexpr(right, ctx, names).await?;
+            }
+            SetExpr::Query(q) => {
+                transform_setexpr(&mut q.body, ctx, names).await?;
+            }
+            _ => {}
         }
-        if let Some(e) = &mut s.selection {
-            transform_expr(e, ctx, names, &aliases).await?;
-        }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 fn transform_expr<'a>(
@@ -167,6 +181,11 @@ fn transform_expr<'a>(
                 transform_expr(inner, ctx, names, aliases).await?;
             }
             Expr::Nested(inner) => {
+                transform_expr(inner, ctx, names, aliases).await?;
+            }
+            Expr::Cast { expr: inner, .. } => {
+                // A subquery can hide inside a cast, e.g. `(CASE ... (subq) ...)::text`.
+                // Recurse so the correlated subquery within is still found.
                 transform_expr(inner, ctx, names, aliases).await?;
             }
             Expr::Case {
@@ -993,6 +1012,30 @@ mod tests {
             "expected three subquery UDFs, got {} in {}",
             count, rewritten
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rewrites_correlated_subquery_inside_a_cast() -> datafusion::error::Result<()> {
+        // A correlated subquery hidden inside a cast must still be rewritten;
+        // the walker has to descend into `Expr::Cast`.
+        let sql = "SELECT t1.id, (CASE WHEN (SELECT t2.x FROM t2 WHERE t2.id = t1.id) \
+                   THEN 'y' ELSE 'n' END)::text AS c FROM t1";
+        let (rewritten, names) = rewrite_query(sql, &mut SessionContext::new()).await?;
+        assert_eq!(names.len(), 1, "subquery inside a cast not rewritten: {rewritten}");
+        assert!(rewritten.contains("__subq"), "{rewritten}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rewrites_correlated_subquery_in_a_union_branch() -> datafusion::error::Result<()> {
+        // A correlated subquery in any branch of a UNION must be rewritten; the
+        // walker has to recurse into `SetExpr::SetOperation`.
+        let sql = "SELECT t1.id, (SELECT t2.x FROM t2 WHERE t2.id = t1.id) AS c FROM t1 \
+                   UNION ALL SELECT t3.id, NULL FROM t3";
+        let (rewritten, names) = rewrite_query(sql, &mut SessionContext::new()).await?;
+        assert_eq!(names.len(), 1, "subquery in a UNION branch not rewritten: {rewritten}");
+        assert!(rewritten.contains("__subq"), "{rewritten}");
         Ok(())
     }
 
