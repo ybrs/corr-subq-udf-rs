@@ -1,7 +1,7 @@
 # Git hooks
 
 `pre-commit` runs `../run_all_tests.sh` and refuses the commit if anything in it
-fails: formatting, clippy at pedantic, flake8, and every test suite. It runs
+fails: formatting, clippy at pedantic, and every test suite. It runs
 whatever the change was - a one-line README edit runs the same checks as a
 rewrite of the view planner.
 

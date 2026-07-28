@@ -1,19 +1,3 @@
-// The one pedantic lint this crate does not satisfy, allowed deliberately
-// rather than worked around.
-//
-// The three functions it fires on in the library - qualify_expr, collect_expr
-// and replace_expr - are walkers over sqlparser's `Expr`, and their length is
-// one match arm per SQL expression variant. Splitting them would mean cutting
-// that match into arbitrary groups and routing between them, which makes the
-// walker harder to read and makes it easier to miss a variant, not harder. The
-// remaining hits are two end-to-end query tests and a fixture that registers
-// example tables one after another; each is a straight sequence with nothing to
-// factor out.
-//
-// This is not a licence to write long functions: prefer under 100 lines, and
-// only a genuine one-arm-per-variant walker belongs on this list.
-#![allow(clippy::too_many_lines)]
-
 use arrow::datatypes::DataType;
 use datafusion::logical_expr::{
     expr_fn::SimpleScalarUDF, ColumnarValue, ScalarUDF, Signature, Volatility,
@@ -22,12 +6,13 @@ use datafusion::prelude::SessionContext;
 use datafusion::scalar::ScalarValue;
 use futures::future::BoxFuture;
 use sqlparser::ast::{
-    Expr, Function, FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments,
-    GroupByExpr, Ident, ObjectName, ObjectNamePart, Query, Select, SelectItem, SetExpr, Statement,
-    TableFactor, TableWithJoins, Value,
+    CaseWhen, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArgumentList,
+    FunctionArguments, GroupByExpr, Ident, ObjectName, ObjectNamePart, Query, Select, SelectItem,
+    SetExpr, Statement, TableFactor, TableWithJoins, Value,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
@@ -205,7 +190,7 @@ fn transform_expr<'a>(
     Box::pin(async move {
         match expr {
             Expr::Subquery(q) => {
-                qualify_unqualified_columns(q, aliases);
+                qualify_columns_in_query(q, aliases);
                 let cols = find_correlated_columns_with_aliases(q, aliases);
                 let id = NEXT_UDF_ID.fetch_add(1, Ordering::SeqCst);
                 let fn_name = format!("__subq{id}");
@@ -214,7 +199,7 @@ fn transform_expr<'a>(
                 replace_with_fn_call(expr, fn_name, &cols);
             }
             Expr::Exists { subquery, .. } => {
-                qualify_unqualified_columns(subquery, aliases);
+                qualify_columns_in_query(subquery, aliases);
                 let cols = find_correlated_columns_with_aliases(subquery, aliases);
                 let id = NEXT_UDF_ID.fetch_add(1, Ordering::SeqCst);
                 let fn_name = format!("__subq{id}");
@@ -276,7 +261,7 @@ fn transform_expr<'a>(
                 ..
             } => {
                 transform_expr(inner, ctx, names, aliases).await?;
-                qualify_unqualified_columns(subquery, aliases);
+                qualify_columns_in_query(subquery, aliases);
                 let cols = find_correlated_columns_with_aliases(subquery, aliases);
                 let id = NEXT_UDF_ID.fetch_add(1, Ordering::SeqCst);
                 let fn_name = format!("__subq{id}");
@@ -374,392 +359,730 @@ fn find_column(name: &str, aliases: &AliasMap) -> Option<Expr> {
     None
 }
 
-fn qualify_unqualified_columns(q: &mut Query, outer: &AliasMap) {
-    use std::collections::{HashMap, HashSet};
-
-    fn gather_columns(map: &HashMap<String, String>) -> HashSet<String> {
-        let mut out = HashSet::new();
-        for table in map.values() {
-            if let Some(cols) = table_columns(table) {
-                for c in cols {
-                    out.insert(c.to_string());
-                }
-            }
-        }
-        out
-    }
-
-    fn qualify_expr(
-        expr: &mut Expr,
-        local_aliases: &HashMap<String, String>,
-        local_cols: &HashSet<String>,
-        outer_aliases: &AliasMap,
-    ) {
-        match expr {
-            Expr::Identifier(ident) => {
-                if !local_cols.contains(&ident.value) {
-                    if let Some(Expr::CompoundIdentifier(idents)) =
-                        find_column(&ident.value, outer_aliases)
-                    {
-                        *expr = Expr::CompoundIdentifier(idents);
-                    }
-                }
-            }
-            Expr::BinaryOp { left, right, .. } => {
-                qualify_expr(left, local_aliases, local_cols, outer_aliases);
-                qualify_expr(right, local_aliases, local_cols, outer_aliases);
-            }
-            // Wrappers carrying exactly one inner expression, descended alike.
-            Expr::UnaryOp { expr: inner, .. }
-            | Expr::Nested(inner)
-            | Expr::Cast { expr: inner, .. }
-            | Expr::Collate { expr: inner, .. } => {
-                qualify_expr(inner, local_aliases, local_cols, outer_aliases);
-            }
-            Expr::Function(f) => match &mut f.args {
-                FunctionArguments::List(list) => {
-                    for arg in &mut list.args {
-                        if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) = arg {
-                            qualify_expr(e, local_aliases, local_cols, outer_aliases);
-                        }
-                    }
-                }
-                FunctionArguments::Subquery(q) => {
-                    let mut nested_outer = outer_aliases.clone();
-                    for (k, v) in local_aliases {
-                        nested_outer.insert(k.clone(), v.clone());
-                    }
-                    qualify_query(q, &nested_outer);
-                }
-                FunctionArguments::None => {}
-            },
-            Expr::InList {
-                expr: inner, list, ..
-            } => {
-                qualify_expr(inner, local_aliases, local_cols, outer_aliases);
-                for e in list {
-                    qualify_expr(e, local_aliases, local_cols, outer_aliases);
-                }
-            }
-            Expr::Between {
-                expr: inner,
-                low,
-                high,
-                ..
-            } => {
-                qualify_expr(inner, local_aliases, local_cols, outer_aliases);
-                qualify_expr(low, local_aliases, local_cols, outer_aliases);
-                qualify_expr(high, local_aliases, local_cols, outer_aliases);
-            }
-            Expr::Case {
-                operand,
-                conditions,
-                else_result,
-                ..
-            } => {
-                if let Some(op) = operand {
-                    qualify_expr(op, local_aliases, local_cols, outer_aliases);
-                }
-                for when in conditions {
-                    qualify_expr(
-                        &mut when.condition,
-                        local_aliases,
-                        local_cols,
-                        outer_aliases,
-                    );
-                    qualify_expr(&mut when.result, local_aliases, local_cols, outer_aliases);
-                }
-                if let Some(er) = else_result {
-                    qualify_expr(er, local_aliases, local_cols, outer_aliases);
-                }
-            }
-            Expr::Substring {
-                expr: inner,
-                substring_from,
-                substring_for,
-                ..
-            } => {
-                qualify_expr(inner, local_aliases, local_cols, outer_aliases);
-                if let Some(e) = substring_from {
-                    qualify_expr(e, local_aliases, local_cols, outer_aliases);
-                }
-                if let Some(e) = substring_for {
-                    qualify_expr(e, local_aliases, local_cols, outer_aliases);
-                }
-            }
-            Expr::Subquery(q) => {
-                let mut nested_outer = outer_aliases.clone();
-                for (k, v) in local_aliases {
-                    nested_outer.insert(k.clone(), v.clone());
-                }
-                qualify_query(q, &nested_outer);
-            }
-            Expr::Exists { subquery, .. } => {
-                let mut nested_outer = outer_aliases.clone();
-                for (k, v) in local_aliases {
-                    nested_outer.insert(k.clone(), v.clone());
-                }
-                qualify_query(subquery, &nested_outer);
-            }
-            Expr::InSubquery {
-                subquery,
-                expr: inner,
-                ..
-            } => {
-                qualify_expr(inner, local_aliases, local_cols, outer_aliases);
-                let mut nested_outer = outer_aliases.clone();
-                for (k, v) in local_aliases {
-                    nested_outer.insert(k.clone(), v.clone());
-                }
-                qualify_query(subquery, &nested_outer);
-            }
-            _ => {}
-        }
-    }
-
-    fn qualify_from_select(sel: &mut Select, outer_aliases: &AliasMap) {
-        let mut local_aliases = HashMap::new();
-        for twj in &sel.from {
-            collect_table_with_joins_aliases(twj, &mut local_aliases);
-        }
-        let local_cols = gather_columns(&local_aliases);
-        if let Some(selection) = &mut sel.selection {
-            qualify_expr(selection, &local_aliases, &local_cols, outer_aliases);
-        }
-        for item in &mut sel.projection {
-            match item {
-                SelectItem::UnnamedExpr(e) => {
-                    qualify_expr(e, &local_aliases, &local_cols, outer_aliases);
-                }
-                SelectItem::ExprWithAlias { expr, .. } => {
-                    qualify_expr(expr, &local_aliases, &local_cols, outer_aliases);
-                }
-                _ => {}
-            }
-        }
-        if let GroupByExpr::Expressions(exprs, _) = &mut sel.group_by {
-            for g in exprs {
-                qualify_expr(g, &local_aliases, &local_cols, outer_aliases);
-            }
-        }
-        if let Some(h) = &mut sel.having {
-            qualify_expr(h, &local_aliases, &local_cols, outer_aliases);
-        }
-    }
-
-    fn qualify_query(q: &mut Query, outer_aliases: &AliasMap) {
-        if let SetExpr::Select(sel) = q.body.as_mut() {
-            qualify_from_select(sel, outer_aliases);
-        }
-    }
-
-    qualify_query(q, outer);
+/// The names an expression written inside one `SELECT` resolves against.
+///
+/// Deciding whether a column reference is local or points out to an enclosing
+/// query - which is what makes a subquery correlated - needs all three of these
+/// at once, so they travel together.
+struct ColumnScope<'a> {
+    /// Names the local `FROM` clause brings into scope, mapped to the real
+    /// table each one stands for.
+    local_aliases: &'a AliasMap,
+    /// Every column name the local tables provide. An unqualified name found
+    /// here belongs to this query rather than to an enclosing one.
+    local_columns: &'a HashSet<String>,
+    /// Names the enclosing queries brought into scope.
+    outer_aliases: &'a AliasMap,
 }
 
+impl ColumnScope<'_> {
+    /// The outer scope a subquery written at this point sees: the enclosing
+    /// aliases plus this query's own, which is what lets a column of this query
+    /// resolve from inside that subquery.
+    fn aliases_visible_to_subquery(&self) -> AliasMap {
+        let mut visible = self.outer_aliases.clone();
+        for (alias, table) in self.local_aliases {
+            visible.insert(alias.clone(), table.clone());
+        }
+        visible
+    }
+}
+
+/// Every column name the tables behind `aliases` provide.
+///
+/// A name in this set can be written without a qualifier in the query those
+/// aliases belong to, so meeting one is not evidence of a correlated reference.
+fn column_names_in_scope(aliases: &AliasMap) -> HashSet<String> {
+    let mut names = HashSet::new();
+    for table in aliases.values() {
+        if let Some(columns) = table_columns(table) {
+            for column in columns {
+                names.insert((*column).to_string());
+            }
+        }
+    }
+    names
+}
+
+/// Rewrite `q` so every column name in it that belongs to an enclosing query
+/// carries that query's alias.
+///
+/// A correlated column has to be spelled `alias.column` before its subquery can
+/// be lifted into a UDF, because the lifted subquery has no enclosing `FROM`
+/// clause left for a bare name to resolve against.
+fn qualify_columns_in_query(q: &mut Query, outer_aliases: &AliasMap) {
+    if let SetExpr::Select(sel) = q.body.as_mut() {
+        qualify_columns_in_select(sel, outer_aliases);
+    }
+}
+
+/// Qualify the columns in every clause of `sel` that can hold an expression:
+/// the projection, `WHERE`, `GROUP BY` and `HAVING`.
+fn qualify_columns_in_select(sel: &mut Select, outer_aliases: &AliasMap) {
+    let mut local_aliases = AliasMap::new();
+    for table_with_joins in &sel.from {
+        collect_table_with_joins_aliases(table_with_joins, &mut local_aliases);
+    }
+    let local_columns = column_names_in_scope(&local_aliases);
+    let scope = ColumnScope {
+        local_aliases: &local_aliases,
+        local_columns: &local_columns,
+        outer_aliases,
+    };
+    if let Some(selection) = &mut sel.selection {
+        qualify_columns_in_expr(selection, &scope);
+    }
+    for item in &mut sel.projection {
+        if let SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } = item {
+            qualify_columns_in_expr(e, &scope);
+        }
+    }
+    if let GroupByExpr::Expressions(exprs, _) = &mut sel.group_by {
+        for grouping in exprs {
+            qualify_columns_in_expr(grouping, &scope);
+        }
+    }
+    if let Some(having) = &mut sel.having {
+        qualify_columns_in_expr(having, &scope);
+    }
+}
+
+/// Qualify the columns of `expr` against `scope`, in place.
+///
+/// This match is the single place every expression shape the rewrite
+/// understands is listed; each arm either descends into the expressions its
+/// shape holds or hands them to the function named for that group. A shape
+/// nobody handles therefore shows up here as a missing arm.
+fn qualify_columns_in_expr(expr: &mut Expr, scope: &ColumnScope<'_>) {
+    match expr {
+        // The only shape this pass rewrites. Every other arm exists to reach
+        // the bare column names nested inside it.
+        Expr::Identifier(ident) => {
+            if let Some(qualified) = column_qualified_by_outer_query(&ident.value, scope) {
+                *expr = qualified;
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            qualify_columns_in_expr(left, scope);
+            qualify_columns_in_expr(right, scope);
+        }
+        // Wrappers carrying exactly one inner expression, descended alike.
+        Expr::UnaryOp { expr: inner, .. }
+        | Expr::Nested(inner)
+        | Expr::Cast { expr: inner, .. }
+        | Expr::Collate { expr: inner, .. } => qualify_columns_in_expr(inner, scope),
+        Expr::Function(f) => qualify_columns_in_function_arguments(&mut f.args, scope),
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => qualify_columns_in_case_branches(
+            operand.as_deref_mut(),
+            conditions,
+            else_result.as_deref_mut(),
+            scope,
+        ),
+        Expr::InList {
+            expr: inner, list, ..
+        } => {
+            qualify_columns_in_expr(inner, scope);
+            for candidate in list {
+                qualify_columns_in_expr(candidate, scope);
+            }
+        }
+        Expr::Between {
+            expr: inner,
+            low,
+            high,
+            ..
+        } => {
+            qualify_columns_in_expr(inner, scope);
+            qualify_columns_in_expr(low, scope);
+            qualify_columns_in_expr(high, scope);
+        }
+        Expr::Substring {
+            expr: inner,
+            substring_from,
+            substring_for,
+            ..
+        } => {
+            qualify_columns_in_expr(inner, scope);
+            if let Some(start) = substring_from {
+                qualify_columns_in_expr(start, scope);
+            }
+            if let Some(length) = substring_for {
+                qualify_columns_in_expr(length, scope);
+            }
+        }
+        // A subquery resolves against this query's names as well as its own, so
+        // it is walked with the widened scope rather than `scope`.
+        Expr::Subquery(q) | Expr::Exists { subquery: q, .. } => {
+            qualify_columns_in_query(q, &scope.aliases_visible_to_subquery());
+        }
+        Expr::InSubquery {
+            subquery,
+            expr: inner,
+            ..
+        } => {
+            qualify_columns_in_expr(inner, scope);
+            qualify_columns_in_query(subquery, &scope.aliases_visible_to_subquery());
+        }
+        _ => {}
+    }
+}
+
+/// The alias-qualified form of the bare column `name`, or `None` when `name` is
+/// one of the local query's own columns or no enclosing alias provides it.
+fn column_qualified_by_outer_query(name: &str, scope: &ColumnScope<'_>) -> Option<Expr> {
+    if scope.local_columns.contains(name) {
+        return None;
+    }
+    // `find_column` answers with a compound identifier; matching on that keeps
+    // a future change to it from substituting some other shape here.
+    match find_column(name, scope.outer_aliases) {
+        Some(Expr::CompoundIdentifier(idents)) => Some(Expr::CompoundIdentifier(idents)),
+        _ => None,
+    }
+}
+
+/// Qualify the columns of a function call's arguments.
+///
+/// An ordinary argument list is descended into expression by expression; a
+/// whole-query argument (`f(SELECT ...)`) is walked as a subquery, seeing this
+/// query's aliases as its outer scope.
+fn qualify_columns_in_function_arguments(args: &mut FunctionArguments, scope: &ColumnScope<'_>) {
+    match args {
+        FunctionArguments::List(list) => {
+            for arg in &mut list.args {
+                if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) = arg {
+                    qualify_columns_in_expr(e, scope);
+                }
+            }
+        }
+        FunctionArguments::Subquery(q) => {
+            qualify_columns_in_query(q, &scope.aliases_visible_to_subquery());
+        }
+        FunctionArguments::None => {}
+    }
+}
+
+/// Qualify the columns of every part of a `CASE`: the operand of a simple
+/// `CASE`, each `WHEN` condition with its result, and the `ELSE` result.
+fn qualify_columns_in_case_branches(
+    operand: Option<&mut Expr>,
+    conditions: &mut [CaseWhen],
+    else_result: Option<&mut Expr>,
+    scope: &ColumnScope<'_>,
+) {
+    if let Some(operand) = operand {
+        qualify_columns_in_expr(operand, scope);
+    }
+    for when in conditions {
+        qualify_columns_in_expr(&mut when.condition, scope);
+        qualify_columns_in_expr(&mut when.result, scope);
+    }
+    if let Some(else_result) = else_result {
+        qualify_columns_in_expr(else_result, scope);
+    }
+}
+
+/// The columns `q` refers to that belong to an enclosing query, in the order
+/// they become arguments of the UDF the subquery is lifted into.
+///
+/// `outer` holds the aliases the enclosing query brought into scope. Every
+/// column is reported with type [`DataType::Null`]; the real type is settled
+/// later, by planning the rewritten subquery.
 fn find_correlated_columns_with_aliases(q: &Query, outer: &AliasMap) -> Vec<(Expr, DataType)> {
-    use std::collections::{BTreeMap, HashMap, HashSet};
-
-    fn gather_columns(map: &HashMap<String, String>) -> HashSet<String> {
-        let mut out = HashSet::new();
-        for table in map.values() {
-            if let Some(cols) = table_columns(table) {
-                for c in cols {
-                    out.insert(c.to_string());
-                }
-            }
-        }
-        out
-    }
-
-    fn collect_expr(
-        expr: &Expr,
-        local_aliases: &HashMap<String, String>,
-        local_cols: &HashSet<String>,
-        outer_aliases: &AliasMap,
-        cols: &mut BTreeMap<String, Expr>,
-    ) {
-        match expr {
-            Expr::Identifier(ident) => {
-                if !local_cols.contains(&ident.value) {
-                    if let Some(e) = find_column(&ident.value, outer_aliases) {
-                        cols.entry(e.to_string()).or_insert(e);
-                    }
-                }
-            }
-            Expr::CompoundIdentifier(idents) => {
-                let alias_idx = if idents.len() >= 2 {
-                    idents.len() - 2
-                } else {
-                    0
-                };
-                if let Some(ident) = idents.get(alias_idx) {
-                    if !local_aliases.contains_key(&ident.value) {
-                        cols.entry(expr.to_string())
-                            .or_insert_with(|| Expr::CompoundIdentifier(idents.clone()));
-                    }
-                }
-            }
-            Expr::BinaryOp { left, right, .. } => {
-                collect_expr(left, local_aliases, local_cols, outer_aliases, cols);
-                collect_expr(right, local_aliases, local_cols, outer_aliases, cols);
-            }
-            // Wrappers carrying exactly one inner expression, descended alike.
-            Expr::UnaryOp { expr: inner, .. }
-            | Expr::Nested(inner)
-            | Expr::Cast { expr: inner, .. }
-            | Expr::Collate { expr: inner, .. } => {
-                collect_expr(inner, local_aliases, local_cols, outer_aliases, cols);
-            }
-            Expr::Function(f) => match &f.args {
-                FunctionArguments::List(list) => {
-                    for arg in &list.args {
-                        if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) = arg {
-                            collect_expr(e, local_aliases, local_cols, outer_aliases, cols);
-                        }
-                    }
-                }
-                FunctionArguments::Subquery(q) => {
-                    let mut nested_outer = outer_aliases.clone();
-                    for (k, v) in local_aliases {
-                        nested_outer.insert(k.clone(), v.clone());
-                    }
-                    collect_query(q, &nested_outer, cols);
-                }
-                FunctionArguments::None => {}
-            },
-            Expr::InList {
-                expr: inner, list, ..
-            } => {
-                collect_expr(inner, local_aliases, local_cols, outer_aliases, cols);
-                for e in list {
-                    collect_expr(e, local_aliases, local_cols, outer_aliases, cols);
-                }
-            }
-            Expr::Between {
-                expr: inner,
-                low,
-                high,
-                ..
-            } => {
-                collect_expr(inner, local_aliases, local_cols, outer_aliases, cols);
-                collect_expr(low, local_aliases, local_cols, outer_aliases, cols);
-                collect_expr(high, local_aliases, local_cols, outer_aliases, cols);
-            }
-            Expr::Case {
-                operand,
-                conditions,
-                else_result,
-                ..
-            } => {
-                if let Some(op) = operand {
-                    collect_expr(op, local_aliases, local_cols, outer_aliases, cols);
-                }
-                for when in conditions {
-                    collect_expr(
-                        &when.condition,
-                        local_aliases,
-                        local_cols,
-                        outer_aliases,
-                        cols,
-                    );
-                    collect_expr(&when.result, local_aliases, local_cols, outer_aliases, cols);
-                }
-                if let Some(er) = else_result {
-                    collect_expr(er, local_aliases, local_cols, outer_aliases, cols);
-                }
-            }
-            Expr::Substring {
-                expr: inner,
-                substring_from,
-                substring_for,
-                ..
-            } => {
-                collect_expr(inner, local_aliases, local_cols, outer_aliases, cols);
-                if let Some(e) = substring_from {
-                    collect_expr(e, local_aliases, local_cols, outer_aliases, cols);
-                }
-                if let Some(e) = substring_for {
-                    collect_expr(e, local_aliases, local_cols, outer_aliases, cols);
-                }
-            }
-            Expr::Subquery(q) => {
-                let mut nested_outer = outer_aliases.clone();
-                for (k, v) in local_aliases {
-                    nested_outer.insert(k.clone(), v.clone());
-                }
-                collect_query(q, &nested_outer, cols);
-            }
-            Expr::Exists { subquery, .. } => {
-                let mut nested_outer = outer_aliases.clone();
-                for (k, v) in local_aliases {
-                    nested_outer.insert(k.clone(), v.clone());
-                }
-                collect_query(subquery, &nested_outer, cols);
-            }
-            Expr::InSubquery {
-                subquery,
-                expr: inner,
-                ..
-            } => {
-                collect_expr(inner, local_aliases, local_cols, outer_aliases, cols);
-                let mut nested_outer = outer_aliases.clone();
-                for (k, v) in local_aliases {
-                    nested_outer.insert(k.clone(), v.clone());
-                }
-                collect_query(subquery, &nested_outer, cols);
-            }
-            _ => {}
-        }
-    }
-
-    fn collect_from_select(
-        sel: &Select,
-        outer_aliases: &AliasMap,
-        cols: &mut BTreeMap<String, Expr>,
-    ) {
-        let mut local_aliases = HashMap::new();
-        for twj in &sel.from {
-            collect_table_with_joins_aliases(twj, &mut local_aliases);
-        }
-        let local_cols = gather_columns(&local_aliases);
-        if let Some(selection) = &sel.selection {
-            collect_expr(selection, &local_aliases, &local_cols, outer_aliases, cols);
-        }
-        for item in &sel.projection {
-            match item {
-                SelectItem::UnnamedExpr(e) => {
-                    collect_expr(e, &local_aliases, &local_cols, outer_aliases, cols);
-                }
-                SelectItem::ExprWithAlias { expr, .. } => {
-                    collect_expr(expr, &local_aliases, &local_cols, outer_aliases, cols);
-                }
-                _ => {}
-            }
-        }
-        if let GroupByExpr::Expressions(exprs, _) = &sel.group_by {
-            for g in exprs {
-                collect_expr(g, &local_aliases, &local_cols, outer_aliases, cols);
-            }
-        }
-        if let Some(h) = &sel.having {
-            collect_expr(h, &local_aliases, &local_cols, outer_aliases, cols);
-        }
-    }
-
-    fn collect_query(q: &Query, outer_aliases: &AliasMap, cols: &mut BTreeMap<String, Expr>) {
-        if let SetExpr::Select(sel) = q.body.as_ref() {
-            collect_from_select(sel, outer_aliases, cols);
-        }
-    }
-    let mut cols_map: BTreeMap<String, Expr> = BTreeMap::new();
-    collect_query(q, outer, &mut cols_map);
-
-    cols_map
+    let mut correlated_columns: BTreeMap<String, Expr> = BTreeMap::new();
+    collect_correlated_columns_in_query(q, outer, &mut correlated_columns);
+    correlated_columns
         .into_values()
         .map(|e| (e, DataType::Null))
         .collect()
 }
 
+/// Record the correlated columns of `q` into `correlated_columns`.
+///
+/// The map is keyed by the printed form of the column, so the same column met
+/// twice is passed to the UDF once.
+fn collect_correlated_columns_in_query(
+    q: &Query,
+    outer_aliases: &AliasMap,
+    correlated_columns: &mut BTreeMap<String, Expr>,
+) {
+    if let SetExpr::Select(sel) = q.body.as_ref() {
+        collect_correlated_columns_in_select(sel, outer_aliases, correlated_columns);
+    }
+}
+
+/// Record the correlated columns of every clause of `sel` that can hold an
+/// expression: the projection, `WHERE`, `GROUP BY` and `HAVING`.
+fn collect_correlated_columns_in_select(
+    sel: &Select,
+    outer_aliases: &AliasMap,
+    correlated_columns: &mut BTreeMap<String, Expr>,
+) {
+    let mut local_aliases = AliasMap::new();
+    for table_with_joins in &sel.from {
+        collect_table_with_joins_aliases(table_with_joins, &mut local_aliases);
+    }
+    let local_columns = column_names_in_scope(&local_aliases);
+    let scope = ColumnScope {
+        local_aliases: &local_aliases,
+        local_columns: &local_columns,
+        outer_aliases,
+    };
+    if let Some(selection) = &sel.selection {
+        collect_correlated_columns_in_expr(selection, &scope, correlated_columns);
+    }
+    for item in &sel.projection {
+        if let SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } = item {
+            collect_correlated_columns_in_expr(e, &scope, correlated_columns);
+        }
+    }
+    if let GroupByExpr::Expressions(exprs, _) = &sel.group_by {
+        for grouping in exprs {
+            collect_correlated_columns_in_expr(grouping, &scope, correlated_columns);
+        }
+    }
+    if let Some(having) = &sel.having {
+        collect_correlated_columns_in_expr(having, &scope, correlated_columns);
+    }
+}
+
+/// Record every correlated column reference in `expr` into `correlated_columns`.
+///
+/// This match is the single place every expression shape the rewrite
+/// understands is listed; each arm either descends into the expressions its
+/// shape holds or hands them to the function named for that group. A shape
+/// nobody handles therefore shows up here as a missing arm.
+fn collect_correlated_columns_in_expr(
+    expr: &Expr,
+    scope: &ColumnScope<'_>,
+    correlated_columns: &mut BTreeMap<String, Expr>,
+) {
+    match expr {
+        // The two shapes a column reference can take; every other arm exists to
+        // reach the references nested inside it.
+        Expr::Identifier(ident) => {
+            collect_bare_column(&ident.value, scope, correlated_columns);
+        }
+        Expr::CompoundIdentifier(idents) => {
+            collect_qualified_column(idents, scope, correlated_columns);
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            collect_correlated_columns_in_expr(left, scope, correlated_columns);
+            collect_correlated_columns_in_expr(right, scope, correlated_columns);
+        }
+        // Wrappers carrying exactly one inner expression, descended alike.
+        Expr::UnaryOp { expr: inner, .. }
+        | Expr::Nested(inner)
+        | Expr::Cast { expr: inner, .. }
+        | Expr::Collate { expr: inner, .. } => {
+            collect_correlated_columns_in_expr(inner, scope, correlated_columns);
+        }
+        Expr::Function(f) => {
+            collect_correlated_columns_in_function_arguments(&f.args, scope, correlated_columns);
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => collect_correlated_columns_in_case_branches(
+            operand.as_deref(),
+            conditions,
+            else_result.as_deref(),
+            scope,
+            correlated_columns,
+        ),
+        Expr::InList {
+            expr: inner, list, ..
+        } => {
+            collect_correlated_columns_in_expr(inner, scope, correlated_columns);
+            for candidate in list {
+                collect_correlated_columns_in_expr(candidate, scope, correlated_columns);
+            }
+        }
+        Expr::Between {
+            expr: inner,
+            low,
+            high,
+            ..
+        } => {
+            collect_correlated_columns_in_expr(inner, scope, correlated_columns);
+            collect_correlated_columns_in_expr(low, scope, correlated_columns);
+            collect_correlated_columns_in_expr(high, scope, correlated_columns);
+        }
+        Expr::Substring {
+            expr: inner,
+            substring_from,
+            substring_for,
+            ..
+        } => {
+            collect_correlated_columns_in_expr(inner, scope, correlated_columns);
+            if let Some(start) = substring_from {
+                collect_correlated_columns_in_expr(start, scope, correlated_columns);
+            }
+            if let Some(length) = substring_for {
+                collect_correlated_columns_in_expr(length, scope, correlated_columns);
+            }
+        }
+        // A subquery resolves against this query's names as well as its own, so
+        // it is walked with the widened scope rather than `scope`.
+        Expr::Subquery(q) | Expr::Exists { subquery: q, .. } => {
+            collect_correlated_columns_in_query(
+                q,
+                &scope.aliases_visible_to_subquery(),
+                correlated_columns,
+            );
+        }
+        Expr::InSubquery {
+            subquery,
+            expr: inner,
+            ..
+        } => {
+            collect_correlated_columns_in_expr(inner, scope, correlated_columns);
+            collect_correlated_columns_in_query(
+                subquery,
+                &scope.aliases_visible_to_subquery(),
+                correlated_columns,
+            );
+        }
+        _ => {}
+    }
+}
+
+/// Record an unqualified column name as correlated when it is not a column of
+/// the local tables but an enclosing query does provide it.
+fn collect_bare_column(
+    name: &str,
+    scope: &ColumnScope<'_>,
+    correlated_columns: &mut BTreeMap<String, Expr>,
+) {
+    if scope.local_columns.contains(name) {
+        return;
+    }
+    if let Some(column) = find_column(name, scope.outer_aliases) {
+        correlated_columns
+            .entry(column.to_string())
+            .or_insert(column);
+    }
+}
+
+/// Record a qualified column name (`alias.column`, `schema.table.column`) as
+/// correlated when its qualifier is none of the local `FROM` aliases.
+///
+/// The qualifier is the identifier before the column name, so
+/// `schema.table.column` is judged by `table`.
+fn collect_qualified_column(
+    idents: &[Ident],
+    scope: &ColumnScope<'_>,
+    correlated_columns: &mut BTreeMap<String, Expr>,
+) {
+    let qualifier_index = if idents.len() >= 2 {
+        idents.len() - 2
+    } else {
+        0
+    };
+    let Some(qualifier) = idents.get(qualifier_index) else {
+        return;
+    };
+    if scope.local_aliases.contains_key(&qualifier.value) {
+        return;
+    }
+    let column = Expr::CompoundIdentifier(idents.to_vec());
+    correlated_columns
+        .entry(column.to_string())
+        .or_insert(column);
+}
+
+/// Record the correlated columns of a function call's arguments.
+///
+/// An ordinary argument list is descended into expression by expression; a
+/// whole-query argument (`f(SELECT ...)`) is walked as a subquery, seeing this
+/// query's aliases as its outer scope.
+fn collect_correlated_columns_in_function_arguments(
+    args: &FunctionArguments,
+    scope: &ColumnScope<'_>,
+    correlated_columns: &mut BTreeMap<String, Expr>,
+) {
+    match args {
+        FunctionArguments::List(list) => {
+            for arg in &list.args {
+                if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) = arg {
+                    collect_correlated_columns_in_expr(e, scope, correlated_columns);
+                }
+            }
+        }
+        FunctionArguments::Subquery(q) => {
+            collect_correlated_columns_in_query(
+                q,
+                &scope.aliases_visible_to_subquery(),
+                correlated_columns,
+            );
+        }
+        FunctionArguments::None => {}
+    }
+}
+
+/// Record the correlated columns of every part of a `CASE`: the operand of a
+/// simple `CASE`, each `WHEN` condition with its result, and the `ELSE` result.
+fn collect_correlated_columns_in_case_branches(
+    operand: Option<&Expr>,
+    conditions: &[CaseWhen],
+    else_result: Option<&Expr>,
+    scope: &ColumnScope<'_>,
+    correlated_columns: &mut BTreeMap<String, Expr>,
+) {
+    if let Some(operand) = operand {
+        collect_correlated_columns_in_expr(operand, scope, correlated_columns);
+    }
+    for when in conditions {
+        collect_correlated_columns_in_expr(&when.condition, scope, correlated_columns);
+        collect_correlated_columns_in_expr(&when.result, scope, correlated_columns);
+    }
+    if let Some(else_result) = else_result {
+        collect_correlated_columns_in_expr(else_result, scope, correlated_columns);
+    }
+}
+
+/// The subquery `sub_sql` with every correlated column rewritten as the
+/// positional placeholder that will carry its value at call time.
+///
+/// Placeholders are numbered by position in `cols`, which is the order the
+/// generated UDF takes its arguments in, so `$1` is `cols[0]`.
+///
+/// # Errors
+///
+/// Returns an error if `sub_sql` does not parse.
+fn subquery_sql_with_placeholders(
+    sub_sql: &str,
+    cols: &[(Expr, DataType)],
+) -> datafusion::error::Result<String> {
+    let dialect = GenericDialect {};
+    let mut stmt = Parser::parse_sql(&dialect, sub_sql)
+        .map_err(|e| datafusion::error::DataFusionError::Plan(format!("failed to parse SQL: {e}")))?
+        .remove(0);
+    let targets: Vec<(String, String)> = cols
+        .iter()
+        .enumerate()
+        .map(|(i, (e, _))| (e.to_string(), format!("${}", i + 1)))
+        .collect();
+    if let Statement::Query(q) = &mut stmt {
+        if let SetExpr::Select(sel) = q.body.as_mut() {
+            substitute_placeholders_in_select(sel, &targets);
+        }
+    }
+    Ok(stmt.to_string())
+}
+
+/// Substitute placeholders in every clause of `sel` that can hold an
+/// expression: the projection, `WHERE`, `GROUP BY` and `HAVING`.
+fn substitute_placeholders_in_select(sel: &mut Select, targets: &[(String, String)]) {
+    if let Some(selection) = &mut sel.selection {
+        substitute_placeholders_in_expr(selection, targets);
+    }
+    for item in &mut sel.projection {
+        if let SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } = item {
+            substitute_placeholders_in_expr(e, targets);
+        }
+    }
+    if let GroupByExpr::Expressions(exprs, _) = &mut sel.group_by {
+        for grouping in exprs {
+            substitute_placeholders_in_expr(grouping, targets);
+        }
+    }
+    if let Some(having) = &mut sel.having {
+        substitute_placeholders_in_expr(having, targets);
+    }
+}
+
+/// Substitute placeholders in the `WHERE` clause and the projection of a
+/// subquery nested inside the one being lifted into a UDF.
+fn substitute_placeholders_in_subquery(subquery: &mut Query, targets: &[(String, String)]) {
+    let SetExpr::Select(sel) = subquery.body.as_mut() else {
+        return;
+    };
+    if let Some(selection) = &mut sel.selection {
+        substitute_placeholders_in_expr(selection, targets);
+    }
+    for item in &mut sel.projection {
+        if let SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } = item {
+            substitute_placeholders_in_expr(e, targets);
+        }
+    }
+}
+
+/// Replace `expr` with its placeholder when it is one of the correlated columns
+/// in `targets`, and otherwise substitute placeholders in the expressions it
+/// holds.
+///
+/// The match below is the single place every expression shape the rewrite
+/// understands is listed; each arm either descends into the expressions its
+/// shape holds or hands them to the function named for that group. A shape
+/// nobody handles therefore shows up here as a missing arm.
+fn substitute_placeholders_in_expr(expr: &mut Expr, targets: &[(String, String)]) {
+    // A matching expression is replaced whole, so nothing inside it is walked:
+    // the placeholder already stands for all of it.
+    if let Some(placeholder) = placeholder_for_column(expr, targets) {
+        *expr = placeholder;
+        return;
+    }
+    match expr {
+        Expr::BinaryOp { left, right, .. } => {
+            substitute_placeholders_in_expr(left, targets);
+            substitute_placeholders_in_expr(right, targets);
+        }
+        // Wrappers carrying exactly one inner expression, descended alike.
+        Expr::UnaryOp { expr: inner, .. }
+        | Expr::Nested(inner)
+        | Expr::Cast { expr: inner, .. }
+        | Expr::Collate { expr: inner, .. } => substitute_placeholders_in_expr(inner, targets),
+        Expr::Function(f) => substitute_placeholders_in_function_arguments(&mut f.args, targets),
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => substitute_placeholders_in_case_branches(
+            operand.as_deref_mut(),
+            conditions,
+            else_result.as_deref_mut(),
+            targets,
+        ),
+        Expr::InList {
+            expr: inner, list, ..
+        } => {
+            substitute_placeholders_in_expr(inner, targets);
+            for candidate in list {
+                substitute_placeholders_in_expr(candidate, targets);
+            }
+        }
+        Expr::Between {
+            expr: inner,
+            low,
+            high,
+            ..
+        } => {
+            substitute_placeholders_in_expr(inner, targets);
+            substitute_placeholders_in_expr(low, targets);
+            substitute_placeholders_in_expr(high, targets);
+        }
+        Expr::Substring {
+            expr: inner,
+            substring_from,
+            substring_for,
+            ..
+        } => {
+            substitute_placeholders_in_expr(inner, targets);
+            if let Some(start) = substring_from {
+                substitute_placeholders_in_expr(start, targets);
+            }
+            if let Some(length) = substring_for {
+                substitute_placeholders_in_expr(length, targets);
+            }
+        }
+        Expr::Subquery(q) | Expr::Exists { subquery: q, .. } => {
+            substitute_placeholders_in_subquery(q, targets);
+        }
+        Expr::InSubquery {
+            subquery,
+            expr: inner,
+            ..
+        } => {
+            substitute_placeholders_in_expr(inner, targets);
+            substitute_placeholders_in_subquery(subquery, targets);
+        }
+        _ => {}
+    }
+}
+
+/// The placeholder standing in for `expr`, when `expr` prints as one of the
+/// correlated columns in `targets`.
+///
+/// Columns are matched on their printed form because the same column can be
+/// spelled with different `Ident` spans in the parsed tree.
+fn placeholder_for_column(expr: &Expr, targets: &[(String, String)]) -> Option<Expr> {
+    let printed = expr.to_string();
+    targets.iter().find_map(|(column, placeholder)| {
+        if printed == *column {
+            Some(Expr::Value(Value::Placeholder(placeholder.clone()).into()))
+        } else {
+            None
+        }
+    })
+}
+
+/// Substitute placeholders in a function call's arguments.
+fn substitute_placeholders_in_function_arguments(
+    args: &mut FunctionArguments,
+    targets: &[(String, String)],
+) {
+    match args {
+        FunctionArguments::List(list) => {
+            for arg in &mut list.args {
+                if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) = arg {
+                    substitute_placeholders_in_expr(e, targets);
+                }
+            }
+        }
+        FunctionArguments::Subquery(q) => substitute_placeholders_in_subquery(q, targets),
+        FunctionArguments::None => {}
+    }
+}
+
+/// Substitute placeholders in every part of a `CASE`: the operand of a simple
+/// `CASE`, each `WHEN` condition with its result, and the `ELSE` result.
+fn substitute_placeholders_in_case_branches(
+    operand: Option<&mut Expr>,
+    conditions: &mut [CaseWhen],
+    else_result: Option<&mut Expr>,
+    targets: &[(String, String)],
+) {
+    if let Some(operand) = operand {
+        substitute_placeholders_in_expr(operand, targets);
+    }
+    for when in conditions {
+        substitute_placeholders_in_expr(&mut when.condition, targets);
+        substitute_placeholders_in_expr(&mut when.result, targets);
+    }
+    if let Some(else_result) = else_result {
+        substitute_placeholders_in_expr(else_result, targets);
+    }
+}
+
+/// The type the UDF generated for a subquery returns.
+///
+/// `EXISTS` always answers boolean. Any other subquery returns the type of its
+/// first output column, found by planning the placeholder SQL; one that cannot
+/// be planned - typically because it reads a table registered only later -
+/// falls back to `Null`.
+async fn subquery_return_type(
+    ctx: &SessionContext,
+    placeholder_sql: &str,
+    is_exists: bool,
+) -> DataType {
+    if is_exists {
+        return DataType::Boolean;
+    }
+    match ctx.state().create_logical_plan(placeholder_sql).await {
+        Ok(plan) => plan.schema().field(0).data_type().clone(),
+        Err(_) => DataType::Null,
+    }
+}
+
+/// Register a UDF called `name` in `ctx` that answers the subquery `sub_sql`.
+///
+/// The UDF takes the correlated columns `cols` as its arguments, in order, and
+/// runs the subquery once per row with those values bound to its placeholders.
+/// `is_exists` turns the row count into a boolean instead of returning the
+/// subquery's first column, which is what `EXISTS` means.
+///
+/// # Errors
+///
+/// Returns an error if `sub_sql` does not parse.
 async fn register_udf(
     ctx: &mut SessionContext,
     name: &str,
@@ -767,195 +1090,10 @@ async fn register_udf(
     cols: &[(Expr, DataType)],
     is_exists: bool,
 ) -> datafusion::error::Result<()> {
-    let arg_count = cols.len();
-
-    // replace correlated columns with placeholders like $1, $2
-    let dialect = GenericDialect {};
-    let mut stmt = Parser::parse_sql(&dialect, &sub_sql)
-        .map_err(|e| datafusion::error::DataFusionError::Plan(format!("failed to parse SQL: {e}")))?
-        .remove(0);
-    if let Statement::Query(q) = &mut stmt {
-        fn replace_expr(expr: &mut Expr, targets: &[(String, String)]) {
-            for (src, placeholder) in targets {
-                if expr.to_string() == *src {
-                    *expr = Expr::Value(Value::Placeholder(placeholder.clone()).into());
-                    return;
-                }
-            }
-            match expr {
-                Expr::BinaryOp { left, right, .. } => {
-                    replace_expr(left, targets);
-                    replace_expr(right, targets);
-                }
-                // Wrappers carrying exactly one inner expression, descended alike.
-                Expr::UnaryOp { expr: inner, .. }
-                | Expr::Nested(inner)
-                | Expr::Cast { expr: inner, .. }
-                | Expr::Collate { expr: inner, .. } => {
-                    replace_expr(inner, targets);
-                }
-                Expr::Function(f) => match &mut f.args {
-                    FunctionArguments::List(list) => {
-                        for arg in &mut list.args {
-                            if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) = arg {
-                                replace_expr(e, targets);
-                            }
-                        }
-                    }
-                    FunctionArguments::Subquery(q) => {
-                        if let SetExpr::Select(sel) = q.body.as_mut() {
-                            for item in &mut sel.projection {
-                                if let SelectItem::UnnamedExpr(e)
-                                | SelectItem::ExprWithAlias { expr: e, .. } = item
-                                {
-                                    replace_expr(e, targets);
-                                }
-                            }
-                            if let Some(w) = &mut sel.selection {
-                                replace_expr(w, targets);
-                            }
-                        }
-                    }
-                    FunctionArguments::None => {}
-                },
-                Expr::Exists { subquery, .. } => {
-                    if let SetExpr::Select(sel) = subquery.body.as_mut() {
-                        if let Some(selection) = &mut sel.selection {
-                            replace_expr(selection, targets);
-                        }
-                        for item in &mut sel.projection {
-                            if let SelectItem::UnnamedExpr(e)
-                            | SelectItem::ExprWithAlias { expr: e, .. } = item
-                            {
-                                replace_expr(e, targets);
-                            }
-                        }
-                    }
-                }
-                Expr::Subquery(q) => {
-                    if let SetExpr::Select(sel) = q.body.as_mut() {
-                        if let Some(selection) = &mut sel.selection {
-                            replace_expr(selection, targets);
-                        }
-                        for item in &mut sel.projection {
-                            if let SelectItem::UnnamedExpr(e)
-                            | SelectItem::ExprWithAlias { expr: e, .. } = item
-                            {
-                                replace_expr(e, targets);
-                            }
-                        }
-                    }
-                }
-                Expr::InSubquery {
-                    subquery,
-                    expr: inner,
-                    ..
-                } => {
-                    replace_expr(inner, targets);
-                    if let SetExpr::Select(sel) = subquery.body.as_mut() {
-                        if let Some(selection) = &mut sel.selection {
-                            replace_expr(selection, targets);
-                        }
-                        for item in &mut sel.projection {
-                            if let SelectItem::UnnamedExpr(e)
-                            | SelectItem::ExprWithAlias { expr: e, .. } = item
-                            {
-                                replace_expr(e, targets);
-                            }
-                        }
-                    }
-                }
-                Expr::InList {
-                    expr: inner, list, ..
-                } => {
-                    replace_expr(inner, targets);
-                    for e in list {
-                        replace_expr(e, targets);
-                    }
-                }
-                Expr::Between {
-                    expr: inner,
-                    low,
-                    high,
-                    ..
-                } => {
-                    replace_expr(inner, targets);
-                    replace_expr(low, targets);
-                    replace_expr(high, targets);
-                }
-                Expr::Case {
-                    operand,
-                    conditions,
-                    else_result,
-                    ..
-                } => {
-                    if let Some(op) = operand {
-                        replace_expr(op, targets);
-                    }
-                    for when in conditions {
-                        replace_expr(&mut when.condition, targets);
-                        replace_expr(&mut when.result, targets);
-                    }
-                    if let Some(er) = else_result {
-                        replace_expr(er, targets);
-                    }
-                }
-                Expr::Substring {
-                    expr: inner,
-                    substring_from,
-                    substring_for,
-                    ..
-                } => {
-                    replace_expr(inner, targets);
-                    if let Some(e) = substring_from {
-                        replace_expr(e, targets);
-                    }
-                    if let Some(e) = substring_for {
-                        replace_expr(e, targets);
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        let replacements: Vec<(String, String)> = cols
-            .iter()
-            .enumerate()
-            .map(|(i, (e, _))| (e.to_string(), format!("${}", i + 1)))
-            .collect();
-
-        if let SetExpr::Select(sel) = q.body.as_mut() {
-            if let Some(selection) = &mut sel.selection {
-                replace_expr(selection, &replacements);
-            }
-            for item in &mut sel.projection {
-                match item {
-                    SelectItem::UnnamedExpr(e) => replace_expr(e, &replacements),
-                    SelectItem::ExprWithAlias { expr, .. } => replace_expr(expr, &replacements),
-                    _ => {}
-                }
-            }
-            if let GroupByExpr::Expressions(exprs, _) = &mut sel.group_by {
-                for g in exprs {
-                    replace_expr(g, &replacements);
-                }
-            }
-            if let Some(h) = &mut sel.having {
-                replace_expr(h, &replacements);
-            }
-        }
-    }
-    let placeholder_sql = stmt.to_string();
+    let placeholder_sql = subquery_sql_with_placeholders(&sub_sql, cols)?;
     println!("registering UDF {name} with sql: {placeholder_sql}");
 
-    let ret_type = if is_exists {
-        DataType::Boolean
-    } else {
-        match ctx.state().create_logical_plan(&placeholder_sql).await {
-            Ok(plan) => plan.schema().field(0).data_type().clone(),
-            Err(_) => DataType::Null,
-        }
-    };
+    let ret_type = subquery_return_type(ctx, &placeholder_sql, is_exists).await;
 
     let ctx_clone = ctx.clone();
     let sql_clone = placeholder_sql.clone();
@@ -990,7 +1128,7 @@ async fn register_udf(
         })
     };
 
-    let signature = if arg_count == 0 {
+    let signature = if cols.is_empty() {
         Signature::nullary(Volatility::Volatile)
     } else {
         Signature::variadic_any(Volatility::Volatile)
@@ -1019,24 +1157,9 @@ mod tests {
     use sqlparser::parser::Parser;
     use std::sync::Arc;
 
-    #[tokio::test]
-    async fn transform_exists_subquery() -> datafusion::error::Result<()> {
-        let sql = "select 1 where exists(select 1)";
-        let dialect = GenericDialect {};
-        let mut stmt = Parser::parse_sql(&dialect, sql)
-            .map_err(|e| {
-                datafusion::error::DataFusionError::Plan(format!("failed to parse SQL: {e}"))
-            })?
-            .remove(0);
-        let mut ctx = SessionContext::new();
-        let mut names = Vec::new();
-        transform_statement(&mut stmt, &mut ctx, &mut names).await?;
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn rewrite_big_query() -> datafusion::error::Result<()> {
-        let sql = r"
+    /// The column-metadata query the end-to-end tests run, with every column
+    /// in the `EXISTS` predicates carrying its table alias.
+    const COLUMN_METADATA_QUERY_WITH_QUALIFIED_PREDICATES: &str = r"
         SELECT
             attname                                   AS name,
             attnum                                    AS OID,
@@ -1105,242 +1228,11 @@ mod tests {
           AND  NOT attisdropped
         ORDER BY attnum;
         ";
-        let (rewritten, _) = rewrite_query(sql, &mut SessionContext::new()).await?;
-        let count = rewritten.matches("__subq").count();
-        assert_eq!(
-            count, 3,
-            "expected three subquery UDFs, got {count} in {rewritten}"
-        );
-        Ok(())
-    }
 
-    #[tokio::test]
-    async fn rewrites_correlated_subquery_inside_a_cast() -> datafusion::error::Result<()> {
-        // A correlated subquery hidden inside a cast must still be rewritten;
-        // the walker has to descend into `Expr::Cast`.
-        let sql = "SELECT t1.id, (CASE WHEN (SELECT t2.x FROM t2 WHERE t2.id = t1.id) \
-                   THEN 'y' ELSE 'n' END)::text AS c FROM t1";
-        let (rewritten, names) = rewrite_query(sql, &mut SessionContext::new()).await?;
-        assert_eq!(
-            names.len(),
-            1,
-            "subquery inside a cast not rewritten: {rewritten}"
-        );
-        assert!(rewritten.contains("__subq"), "{rewritten}");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn rewrites_correlated_subquery_in_a_union_branch() -> datafusion::error::Result<()> {
-        // A correlated subquery in any branch of a UNION must be rewritten; the
-        // walker has to recurse into `SetExpr::SetOperation`.
-        let sql = "SELECT t1.id, (SELECT t2.x FROM t2 WHERE t2.id = t1.id) AS c FROM t1 \
-                   UNION ALL SELECT t3.id, NULL FROM t3";
-        let (rewritten, names) = rewrite_query(sql, &mut SessionContext::new()).await?;
-        assert_eq!(
-            names.len(),
-            1,
-            "subquery in a UNION branch not rewritten: {rewritten}"
-        );
-        assert!(rewritten.contains("__subq"), "{rewritten}");
-        Ok(())
-    }
-
-    /// Register the small in-memory tables the query tests run against.
-    fn register_example_data(ctx: &mut SessionContext) -> datafusion::error::Result<()> {
-        ctx.catalog("datafusion")
-            .expect("default catalog")
-            .register_schema("information_schema", Arc::new(MemorySchemaProvider::new()))?;
-        // pg_attribute table
-        let attr_schema = Arc::new(Schema::new(vec![
-            Field::new("attname", DataType::Utf8, false),
-            Field::new("attnum", DataType::Int32, false),
-            Field::new("atttypid", DataType::Int32, false),
-            Field::new("attnotnull", DataType::Boolean, false),
-            Field::new("atthasdef", DataType::Boolean, false),
-            Field::new("attrelid", DataType::Int32, false),
-            Field::new("atttypmod", DataType::Int32, false),
-            Field::new("attisdropped", DataType::Boolean, false),
-        ]));
-        let attr_batch = RecordBatch::try_new(
-            attr_schema.clone(),
-            vec![
-                Arc::new(StringArray::from(vec!["id"])),
-                Arc::new(Int32Array::from(vec![1])),
-                Arc::new(Int32Array::from(vec![23])),
-                Arc::new(BooleanArray::from(vec![true])),
-                Arc::new(BooleanArray::from(vec![false])),
-                Arc::new(Int32Array::from(vec![50010])),
-                Arc::new(Int32Array::from(vec![0])),
-                Arc::new(BooleanArray::from(vec![false])),
-            ],
-        )?;
-        let attr_table = MemTable::try_new(attr_schema, vec![vec![attr_batch]])?;
-        ctx.register_table("pg_attribute", Arc::new(attr_table))?;
-
-        // pg_type table
-        let typ_schema = Arc::new(Schema::new(vec![
-            Field::new("oid", DataType::Int32, false),
-            Field::new("typname", DataType::Utf8, false),
-            Field::new("typtype", DataType::Utf8, false),
-            Field::new("typtypmod", DataType::Int32, false),
-        ]));
-        let typ_batch = RecordBatch::try_new(
-            typ_schema.clone(),
-            vec![
-                Arc::new(Int32Array::from(vec![23])),
-                Arc::new(StringArray::from(vec!["int4"])),
-                Arc::new(StringArray::from(vec!["b"])),
-                Arc::new(Int32Array::from(vec![0])),
-            ],
-        )?;
-        let typ_table = MemTable::try_new(typ_schema, vec![vec![typ_batch]])?;
-        ctx.register_table("pg_type", Arc::new(typ_table))?;
-
-        // pg_class table
-        let pg_class_schema = Arc::new(Schema::new(vec![
-            Field::new("oid", DataType::Int32, false),
-            Field::new("relnamespace", DataType::Int32, false),
-            Field::new("relname", DataType::Utf8, false),
-            Field::new("relkind", DataType::Utf8, false),
-        ]));
-        let pg_class_batch = RecordBatch::try_new(
-            pg_class_schema.clone(),
-            vec![
-                Arc::new(Int32Array::from(vec![50010])),
-                Arc::new(Int32Array::from(vec![2200])),
-                Arc::new(StringArray::from(vec!["mytable"])),
-                Arc::new(StringArray::from(vec!["r"])),
-            ],
-        )?;
-        let pg_class_table = MemTable::try_new(pg_class_schema, vec![vec![pg_class_batch]])?;
-        ctx.register_table("pg_class", Arc::new(pg_class_table))?;
-
-        // pg_namespace table
-        let ns_schema = Arc::new(Schema::new(vec![
-            Field::new("oid", DataType::Int32, false),
-            Field::new("nspname", DataType::Utf8, false),
-        ]));
-        let ns_batch = RecordBatch::try_new(
-            ns_schema.clone(),
-            vec![
-                Arc::new(Int32Array::from(vec![2200])),
-                Arc::new(StringArray::from(vec!["public"])),
-            ],
-        )?;
-        let ns_table = MemTable::try_new(ns_schema, vec![vec![ns_batch]])?;
-        ctx.register_table("pg_namespace", Arc::new(ns_table))?;
-
-        // information_schema.columns table
-        let info_columns_schema = Arc::new(Schema::new(vec![
-            Field::new("table_schema", DataType::Utf8, false),
-            Field::new("table_name", DataType::Utf8, false),
-            Field::new("column_name", DataType::Utf8, false),
-        ]));
-        let info_columns_batch = RecordBatch::try_new(
-            info_columns_schema.clone(),
-            vec![
-                Arc::new(StringArray::from(vec!["public"])),
-                Arc::new(StringArray::from(vec!["mytable"])),
-                Arc::new(StringArray::from(vec!["id"])),
-            ],
-        )?;
-        let info_columns_table =
-            MemTable::try_new(info_columns_schema, vec![vec![info_columns_batch]])?;
-        ctx.register_table("information_schema.columns", Arc::new(info_columns_table))?;
-
-        // pg_attrdef table (empty)
-        let ad_schema = Arc::new(Schema::new(vec![
-            Field::new("adrelid", DataType::Int32, false),
-            Field::new("adnum", DataType::Int32, false),
-            Field::new("adbin", DataType::Utf8, false),
-        ]));
-        let ad_table = MemTable::try_new(ad_schema, vec![vec![]])?;
-        ctx.register_table("pg_attrdef", Arc::new(ad_table))?;
-
-        // information_schema.key_column_usage
-        let kcu_schema = Arc::new(Schema::new(vec![
-            Field::new("table_schema", DataType::Utf8, false),
-            Field::new("table_name", DataType::Utf8, false),
-            Field::new("column_name", DataType::Utf8, false),
-        ]));
-        let kcu_batch = RecordBatch::try_new(
-            kcu_schema.clone(),
-            vec![
-                Arc::new(StringArray::from(vec!["public"])),
-                Arc::new(StringArray::from(vec!["mytable"])),
-                Arc::new(StringArray::from(vec!["id"])),
-            ],
-        )?;
-        let kcu_table = MemTable::try_new(kcu_schema, vec![vec![kcu_batch]])?;
-        ctx.register_table("information_schema.key_column_usage", Arc::new(kcu_table))?;
-
-        // information_schema.table_constraints
-        let tc_schema = Arc::new(Schema::new(vec![
-            Field::new("table_schema", DataType::Utf8, false),
-            Field::new("table_name", DataType::Utf8, false),
-            Field::new("constraint_type", DataType::Utf8, false),
-            Field::new("constraint_name", DataType::Utf8, false),
-        ]));
-        let tc_batch = RecordBatch::try_new(
-            tc_schema.clone(),
-            vec![
-                Arc::new(StringArray::from(vec!["public"])),
-                Arc::new(StringArray::from(vec!["mytable"])),
-                Arc::new(StringArray::from(vec!["UNIQUE"])),
-                Arc::new(StringArray::from(vec!["uniq1"])),
-            ],
-        )?;
-        let tc_table = MemTable::try_new(tc_schema, vec![vec![tc_batch]])?;
-        ctx.register_table("information_schema.table_constraints", Arc::new(tc_table))?;
-
-        // information_schema.constraint_column_usage
-        let ccu_schema = Arc::new(Schema::new(vec![
-            Field::new("table_schema", DataType::Utf8, false),
-            Field::new("table_name", DataType::Utf8, false),
-            Field::new("column_name", DataType::Utf8, false),
-            Field::new("constraint_name", DataType::Utf8, false),
-        ]));
-        let ccu_batch = RecordBatch::try_new(
-            ccu_schema.clone(),
-            vec![
-                Arc::new(StringArray::from(vec!["public"])),
-                Arc::new(StringArray::from(vec!["mytable"])),
-                Arc::new(StringArray::from(vec!["id"])),
-                Arc::new(StringArray::from(vec!["uniq1"])),
-            ],
-        )?;
-        let ccu_table = MemTable::try_new(ccu_schema, vec![vec![ccu_batch]])?;
-        ctx.register_table(
-            "information_schema.constraint_column_usage",
-            Arc::new(ccu_table),
-        )?;
-
-        // register pg_get_expr UDF
-        let fun = |_args: &[ColumnarValue]| {
-            Ok(ColumnarValue::Scalar(
-                datafusion::scalar::ScalarValue::Utf8(Some("expr".to_string())),
-            ))
-        };
-        let udf = create_udf(
-            "pg_get_expr",
-            vec![DataType::Utf8, DataType::Int32],
-            DataType::Utf8,
-            Volatility::Immutable,
-            Arc::new(fun),
-        );
-        ctx.register_udf(udf);
-
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn run_big_query() -> datafusion::error::Result<()> {
-        // ensures unqualified columns inside EXISTS clauses are qualified
-        // and the rewritten query executes correctly.
-        let mut ctx = SessionContext::new();
-        register_example_data(&mut ctx)?;
-        let sql = r"
+    /// The same column-metadata query with the columns in the `EXISTS`
+    /// predicates written bare, which the rewrite has to qualify itself before
+    /// the subqueries can be lifted into UDFs.
+    const COLUMN_METADATA_QUERY_WITH_UNQUALIFIED_PREDICATES: &str = r"
         SELECT
             attname                                   AS name,
             attnum                                    AS OID,
@@ -1409,18 +1301,26 @@ mod tests {
           AND  NOT attisdropped
         ORDER BY attnum;
         ";
-        let mut stmt = Parser::parse_sql(&GenericDialect {}, sql)
-            .map_err(|e| {
-                datafusion::error::DataFusionError::Plan(format!("failed to parse SQL: {e}"))
-            })?
-            .remove(0);
-        let mut names = Vec::new();
-        transform_statement(&mut stmt, &mut ctx, &mut names).await?;
-        let mut rewritten = stmt.to_string();
-        rewritten = rewritten.replace("::oid", "");
 
+    /// Rewrite `sql`, run the result against `ctx` and return the batches it
+    /// produced.
+    ///
+    /// The `::oid` casts are dropped from the rewritten SQL because the session
+    /// has no `oid` type; the fixture tables model those columns as `Int32`.
+    async fn rewrite_and_collect(
+        sql: &str,
+        ctx: &mut SessionContext,
+    ) -> datafusion::error::Result<Vec<RecordBatch>> {
+        let (rewritten, _names) = rewrite_query(sql, ctx).await?;
+        let rewritten = rewritten.replace("::oid", "");
+        println!("rewritten query {rewritten:?}");
         let df = ctx.sql(&rewritten).await?;
-        let batches = df.collect().await?;
+        df.collect().await
+    }
+
+    /// Assert the column-metadata query returned its one expected row: the `id`
+    /// column of `mytable`, which is both a primary key and unique.
+    fn assert_column_metadata_of_mytable_id(batches: &[RecordBatch]) {
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_rows(), 1);
         let batch = &batches[0];
@@ -1445,121 +1345,335 @@ mod tests {
             .unwrap()
             .value(0);
         assert!(isunique);
+    }
 
+    #[tokio::test]
+    async fn transform_exists_subquery() -> datafusion::error::Result<()> {
+        let sql = "select 1 where exists(select 1)";
+        let dialect = GenericDialect {};
+        let mut stmt = Parser::parse_sql(&dialect, sql)
+            .map_err(|e| {
+                datafusion::error::DataFusionError::Plan(format!("failed to parse SQL: {e}"))
+            })?
+            .remove(0);
+        let mut ctx = SessionContext::new();
+        let mut names = Vec::new();
+        transform_statement(&mut stmt, &mut ctx, &mut names).await?;
         Ok(())
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rewrite_big_query() -> datafusion::error::Result<()> {
+        let sql = COLUMN_METADATA_QUERY_WITH_QUALIFIED_PREDICATES;
+        let (rewritten, _) = rewrite_query(sql, &mut SessionContext::new()).await?;
+        let count = rewritten.matches("__subq").count();
+        assert_eq!(
+            count, 3,
+            "expected three subquery UDFs, got {count} in {rewritten}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rewrites_correlated_subquery_inside_a_cast() -> datafusion::error::Result<()> {
+        // A correlated subquery hidden inside a cast must still be rewritten;
+        // the walker has to descend into `Expr::Cast`.
+        let sql = "SELECT t1.id, (CASE WHEN (SELECT t2.x FROM t2 WHERE t2.id = t1.id) \
+                   THEN 'y' ELSE 'n' END)::text AS c FROM t1";
+        let (rewritten, names) = rewrite_query(sql, &mut SessionContext::new()).await?;
+        assert_eq!(
+            names.len(),
+            1,
+            "subquery inside a cast not rewritten: {rewritten}"
+        );
+        assert!(rewritten.contains("__subq"), "{rewritten}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rewrites_correlated_subquery_in_a_union_branch() -> datafusion::error::Result<()> {
+        // A correlated subquery in any branch of a UNION must be rewritten; the
+        // walker has to recurse into `SetExpr::SetOperation`.
+        let sql = "SELECT t1.id, (SELECT t2.x FROM t2 WHERE t2.id = t1.id) AS c FROM t1 \
+                   UNION ALL SELECT t3.id, NULL FROM t3";
+        let (rewritten, names) = rewrite_query(sql, &mut SessionContext::new()).await?;
+        assert_eq!(
+            names.len(),
+            1,
+            "subquery in a UNION branch not rewritten: {rewritten}"
+        );
+        assert!(rewritten.contains("__subq"), "{rewritten}");
+        Ok(())
+    }
+
+    /// Register the small in-memory tables and functions the query tests run
+    /// against: one table per catalog relation the column-metadata query reads,
+    /// each holding the single row that describes `mytable.id`.
+    fn register_example_data(ctx: &mut SessionContext) -> datafusion::error::Result<()> {
+        ctx.catalog("datafusion")
+            .expect("default catalog")
+            .register_schema("information_schema", Arc::new(MemorySchemaProvider::new()))?;
+        register_pg_attribute(ctx)?;
+        register_pg_type(ctx)?;
+        register_pg_class(ctx)?;
+        register_pg_namespace(ctx)?;
+        register_information_schema_columns(ctx)?;
+        register_pg_attrdef(ctx)?;
+        register_information_schema_key_column_usage(ctx)?;
+        register_information_schema_table_constraints(ctx)?;
+        register_information_schema_constraint_column_usage(ctx)?;
+        register_pg_get_expr(ctx);
+        Ok(())
+    }
+
+    /// Register `pg_attribute` with one row: the `id` column of the table with
+    /// oid 50010, of type oid 23, not null and never dropped.
+    fn register_pg_attribute(ctx: &mut SessionContext) -> datafusion::error::Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("attname", DataType::Utf8, false),
+            Field::new("attnum", DataType::Int32, false),
+            Field::new("atttypid", DataType::Int32, false),
+            Field::new("attnotnull", DataType::Boolean, false),
+            Field::new("atthasdef", DataType::Boolean, false),
+            Field::new("attrelid", DataType::Int32, false),
+            Field::new("atttypmod", DataType::Int32, false),
+            Field::new("attisdropped", DataType::Boolean, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["id"])),
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(Int32Array::from(vec![23])),
+                Arc::new(BooleanArray::from(vec![true])),
+                Arc::new(BooleanArray::from(vec![false])),
+                Arc::new(Int32Array::from(vec![50010])),
+                Arc::new(Int32Array::from(vec![0])),
+                Arc::new(BooleanArray::from(vec![false])),
+            ],
+        )?;
+        let table = MemTable::try_new(schema, vec![vec![batch]])?;
+        ctx.register_table("pg_attribute", Arc::new(table))?;
+        Ok(())
+    }
+
+    /// Register `pg_type` with one row: the `int4` base type, oid 23.
+    fn register_pg_type(ctx: &mut SessionContext) -> datafusion::error::Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("oid", DataType::Int32, false),
+            Field::new("typname", DataType::Utf8, false),
+            Field::new("typtype", DataType::Utf8, false),
+            Field::new("typtypmod", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![23])),
+                Arc::new(StringArray::from(vec!["int4"])),
+                Arc::new(StringArray::from(vec!["b"])),
+                Arc::new(Int32Array::from(vec![0])),
+            ],
+        )?;
+        let table = MemTable::try_new(schema, vec![vec![batch]])?;
+        ctx.register_table("pg_type", Arc::new(table))?;
+        Ok(())
+    }
+
+    /// Register `pg_class` with one row: the ordinary table `mytable`, oid
+    /// 50010, in the namespace with oid 2200.
+    fn register_pg_class(ctx: &mut SessionContext) -> datafusion::error::Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("oid", DataType::Int32, false),
+            Field::new("relnamespace", DataType::Int32, false),
+            Field::new("relname", DataType::Utf8, false),
+            Field::new("relkind", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![50010])),
+                Arc::new(Int32Array::from(vec![2200])),
+                Arc::new(StringArray::from(vec!["mytable"])),
+                Arc::new(StringArray::from(vec!["r"])),
+            ],
+        )?;
+        let table = MemTable::try_new(schema, vec![vec![batch]])?;
+        ctx.register_table("pg_class", Arc::new(table))?;
+        Ok(())
+    }
+
+    /// Register `pg_namespace` with one row: the `public` schema, oid 2200.
+    fn register_pg_namespace(ctx: &mut SessionContext) -> datafusion::error::Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("oid", DataType::Int32, false),
+            Field::new("nspname", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![2200])),
+                Arc::new(StringArray::from(vec!["public"])),
+            ],
+        )?;
+        let table = MemTable::try_new(schema, vec![vec![batch]])?;
+        ctx.register_table("pg_namespace", Arc::new(table))?;
+        Ok(())
+    }
+
+    /// Register `information_schema.columns` with one row: `public.mytable.id`.
+    fn register_information_schema_columns(
+        ctx: &mut SessionContext,
+    ) -> datafusion::error::Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("table_schema", DataType::Utf8, false),
+            Field::new("table_name", DataType::Utf8, false),
+            Field::new("column_name", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["public"])),
+                Arc::new(StringArray::from(vec!["mytable"])),
+                Arc::new(StringArray::from(vec!["id"])),
+            ],
+        )?;
+        let table = MemTable::try_new(schema, vec![vec![batch]])?;
+        ctx.register_table("information_schema.columns", Arc::new(table))?;
+        Ok(())
+    }
+
+    /// Register `pg_attrdef` with no rows, so the column-metadata query finds no
+    /// default expression for `mytable.id`.
+    fn register_pg_attrdef(ctx: &mut SessionContext) -> datafusion::error::Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("adrelid", DataType::Int32, false),
+            Field::new("adnum", DataType::Int32, false),
+            Field::new("adbin", DataType::Utf8, false),
+        ]));
+        let table = MemTable::try_new(schema, vec![vec![]])?;
+        ctx.register_table("pg_attrdef", Arc::new(table))?;
+        Ok(())
+    }
+
+    /// Register `information_schema.key_column_usage` with one row, which makes
+    /// `public.mytable.id` a key column.
+    fn register_information_schema_key_column_usage(
+        ctx: &mut SessionContext,
+    ) -> datafusion::error::Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("table_schema", DataType::Utf8, false),
+            Field::new("table_name", DataType::Utf8, false),
+            Field::new("column_name", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["public"])),
+                Arc::new(StringArray::from(vec!["mytable"])),
+                Arc::new(StringArray::from(vec!["id"])),
+            ],
+        )?;
+        let table = MemTable::try_new(schema, vec![vec![batch]])?;
+        ctx.register_table("information_schema.key_column_usage", Arc::new(table))?;
+        Ok(())
+    }
+
+    /// Register `information_schema.table_constraints` with one row: the unique
+    /// constraint `uniq1` on `public.mytable`.
+    fn register_information_schema_table_constraints(
+        ctx: &mut SessionContext,
+    ) -> datafusion::error::Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("table_schema", DataType::Utf8, false),
+            Field::new("table_name", DataType::Utf8, false),
+            Field::new("constraint_type", DataType::Utf8, false),
+            Field::new("constraint_name", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["public"])),
+                Arc::new(StringArray::from(vec!["mytable"])),
+                Arc::new(StringArray::from(vec!["UNIQUE"])),
+                Arc::new(StringArray::from(vec!["uniq1"])),
+            ],
+        )?;
+        let table = MemTable::try_new(schema, vec![vec![batch]])?;
+        ctx.register_table("information_schema.table_constraints", Arc::new(table))?;
+        Ok(())
+    }
+
+    /// Register `information_schema.constraint_column_usage` with one row, which
+    /// puts `public.mytable.id` under the unique constraint `uniq1`.
+    fn register_information_schema_constraint_column_usage(
+        ctx: &mut SessionContext,
+    ) -> datafusion::error::Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("table_schema", DataType::Utf8, false),
+            Field::new("table_name", DataType::Utf8, false),
+            Field::new("column_name", DataType::Utf8, false),
+            Field::new("constraint_name", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["public"])),
+                Arc::new(StringArray::from(vec!["mytable"])),
+                Arc::new(StringArray::from(vec!["id"])),
+                Arc::new(StringArray::from(vec!["uniq1"])),
+            ],
+        )?;
+        let table = MemTable::try_new(schema, vec![vec![batch]])?;
+        ctx.register_table(
+            "information_schema.constraint_column_usage",
+            Arc::new(table),
+        )?;
+        Ok(())
+    }
+
+    /// Register a `pg_get_expr` that answers a constant.
+    ///
+    /// The column-metadata query calls it for column defaults; the fixture has
+    /// none, so only the fact that the call plans matters here.
+    fn register_pg_get_expr(ctx: &mut SessionContext) {
+        let fun = |_args: &[ColumnarValue]| {
+            Ok(ColumnarValue::Scalar(
+                datafusion::scalar::ScalarValue::Utf8(Some("expr".to_string())),
+            ))
+        };
+        let udf = create_udf(
+            "pg_get_expr",
+            vec![DataType::Utf8, DataType::Int32],
+            DataType::Utf8,
+            Volatility::Immutable,
+            Arc::new(fun),
+        );
+        ctx.register_udf(udf);
+    }
+
+    /// Run the column-metadata query whose `EXISTS` predicates name their
+    /// columns bare, end to end: the rewrite has to qualify those columns for
+    /// the lifted subqueries to resolve, and the result must still be right.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_big_query() -> datafusion::error::Result<()> {
+        let mut ctx = SessionContext::new();
+        register_example_data(&mut ctx)?;
+        let batches =
+            rewrite_and_collect(COLUMN_METADATA_QUERY_WITH_UNQUALIFIED_PREDICATES, &mut ctx)
+                .await?;
+        assert_column_metadata_of_mytable_id(&batches);
+        Ok(())
+    }
+
+    /// Run the column-metadata query whose `EXISTS` predicates are already
+    /// alias-qualified, end to end: rewrite it, execute it, check the row.
     #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
     async fn run_big_query_2() -> datafusion::error::Result<()> {
         let mut ctx = SessionContext::new();
         register_example_data(&mut ctx)?;
-        let sql = r"
-        SELECT
-            attname                                   AS name,
-            attnum                                    AS OID,
-            typ.oid                                   AS typoid,
-            typ.typname                               AS datatype,
-            attnotnull                                AS not_null,
-            attr.atthasdef                            AS has_default_val,
-            nspname,
-            relname,
-            attrelid,
-            CASE
-                WHEN typ.typtype = 'd'
-                     THEN typ.typtypmod
-                ELSE atttypmod
-            END                                       AS typmod,
-            CASE
-                WHEN atthasdef
-                     THEN (
-                         SELECT pg_get_expr(adbin, cls.oid)
-                         FROM   pg_attrdef
-                         WHERE  adrelid = cls.oid
-                         AND    adnum   = attr.attnum
-                     )
-                ELSE NULL
-            END                                       AS default,
-            TRUE                                       AS is_updatable,
-            CASE
-                WHEN EXISTS (
-                    SELECT *
-                    FROM   information_schema.key_column_usage
-                    WHERE  table_schema = ns.nspname
-                    AND    table_name   = cls.relname
-                    AND    column_name  = attr.attname
-                )
-                THEN TRUE ELSE FALSE
-            END                                       AS isprimarykey,
-            CASE
-                WHEN EXISTS (
-                    SELECT *
-                    FROM   information_schema.table_constraints
-                    WHERE  table_schema   = ns.nspname
-                    AND    table_name     = cls.relname
-                    AND    constraint_type = 'UNIQUE'
-                    AND    constraint_name IN (
-                          SELECT constraint_name
-                          FROM   information_schema.constraint_column_usage
-                          WHERE  table_schema = ns.nspname
-                          AND    table_name   = cls.relname
-                          AND    column_name  = attr.attname
-                    )
-                )
-                THEN TRUE ELSE FALSE
-            END                                       AS isunique
-        FROM pg_attribute         AS attr
-        JOIN pg_type              AS typ ON attr.atttypid  = typ.oid
-        JOIN pg_class             AS cls ON cls.oid        = attr.attrelid
-        JOIN pg_namespace         AS ns  ON ns.oid         = cls.relnamespace
-        LEFT JOIN information_schema.columns AS col
-               ON col.table_schema = nspname
-              AND col.table_name   = relname
-              AND col.column_name  = attname
-        WHERE  attr.attrelid = 50010::oid
-          AND  attr.attnum  > 0
-          AND  atttypid     <> 0
-          AND  relkind      IN ('r','v','m','p')
-          AND  NOT attisdropped
-        ORDER BY attnum;
-        ";
-        let mut stmt = Parser::parse_sql(&GenericDialect {}, sql)
-            .map_err(|e| {
-                datafusion::error::DataFusionError::Plan(format!("failed to parse SQL: {e}"))
-            })?
-            .remove(0);
-        let mut names = Vec::new();
-        transform_statement(&mut stmt, &mut ctx, &mut names).await?;
-        let mut rewritten = stmt.to_string();
-        rewritten = rewritten.replace("::oid", "");
-        println!("rewritten query {rewritten:?}");
-
-        let df = ctx.sql(&rewritten).await?;
-        let batches = df.collect().await?;
-        assert_eq!(batches.len(), 1);
-        assert_eq!(batches[0].num_rows(), 1);
-        let batch = &batches[0];
-        let name = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap()
-            .value(0);
-        assert_eq!(name, "id");
-        let isprimary = batch
-            .column(12)
-            .as_any()
-            .downcast_ref::<BooleanArray>()
-            .unwrap()
-            .value(0);
-        assert!(isprimary);
-        let isunique = batch
-            .column(13)
-            .as_any()
-            .downcast_ref::<BooleanArray>()
-            .unwrap()
-            .value(0);
-        assert!(isunique);
-
+        let batches =
+            rewrite_and_collect(COLUMN_METADATA_QUERY_WITH_QUALIFIED_PREDICATES, &mut ctx).await?;
+        assert_column_metadata_of_mytable_id(&batches);
         Ok(())
     }
 
